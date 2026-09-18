@@ -1,8 +1,10 @@
 # Development status
 
-## Milestone 0
+## Milestone 1
 
-The Android foundation is implemented as a single application module. The app launches directly to an inset-safe, portrait Math Fight title screen with the subtitle “Solve. Strike. Win.” No gameplay or network functionality is included.
+The first playable offline battle is implemented. The launch screen starts a match with generated addition, subtraction, and multiplication questions. Correct answers drive a timed attack, 20 damage, the next question, opponent KO after five hits, victory, and restart. The opponent remains passive and player HP remains 100.
+
+Battle state and phase timing are owned by one activity-scoped ViewModel. Combat phases pause while the activity is backgrounded, and stale phase callbacks cannot affect a restarted or abandoned match. Fighters and combat feedback use Compose Canvas and built-in animation only.
 
 Build from `android/` with:
 
@@ -10,20 +12,17 @@ Build from `android/` with:
 ./gradlew :app:assembleDebug
 ```
 
-Build result: blocked before compilation because the environment's proxy returned HTTP 403 while the Gradle wrapper tried to download Gradle 9.5.0. This is an environment limitation, not a reported source-code error. Run the command above in a network-enabled development environment to complete verification.
+Build result: blocked before compilation because the environment proxy returned HTTP 403 while the Gradle wrapper attempted to download Gradle 9.5.0. Run the command above in a network-enabled environment to complete compilation verification.
 
 ## Manual verification
 
-- [ ] Gradle sync succeeds.
-- [ ] App installs and launches.
-- [ ] “Math Fight” and “Solve. Strike. Win.” appear correctly.
-- [ ] Content does not overlap system bars.
-- [ ] Portrait behavior works on the test phone.
-- [ ] Background/resume and close/reopen do not crash.
-- [ ] The installed app opens in airplane mode.
+- [ ] Launch → Start Battle shows two fighters and both HP values at 100.
+- [ ] Addition, subtraction, and multiplication appear with valid ranges.
+- [ ] Keypad editing, submission, and wrong-answer feedback work.
+- [ ] Every correct answer produces one attack and exactly 20 damage.
+- [ ] The fifth correct answer leads through KO to victory.
+- [ ] Restart and system Back reset or abandon the match safely.
+- [ ] Background/resume does not duplicate damage or leave input stuck.
+- [ ] The complete loop works in airplane mode.
 
-Device verification has not yet been performed.
-
-## Next milestone
-
-Milestone 1 is not started: offline answer → attack → damage → next question → KO → restart.
+Phone verification is pending.

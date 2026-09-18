@@ -1,6 +1,6 @@
 # Math Fight
 
-Math Fight is an Android game concept in which solving math questions triggers fighter attacks. The current scope is **Milestone 0**: the foundation for an offline Android prototype. Gameplay is not implemented yet.
+Math Fight is an offline Android game prototype in which solving math questions triggers fighter attacks. The current **Milestone 1** build supports a complete single-player battle through opponent KO and restart.
 
 ## Local setup
 
@@ -28,4 +28,4 @@ Run from `android/`:
 
 ## Install and run
 
-In Android Studio, allow Gradle sync to complete, select an emulator or connected Android phone, and choose **Run > Run 'app'**. The app is an offline launch-screen prototype and does not require a network connection at runtime.
+In Android Studio, allow Gradle sync to complete, select an emulator or connected Android phone, and choose **Run > Run 'app'**. The playable battle does not require a network connection at runtime.
