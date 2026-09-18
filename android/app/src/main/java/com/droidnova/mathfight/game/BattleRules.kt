@@ -4,6 +4,10 @@ import kotlin.random.Random
 
 const val STARTING_HP = 100
 const val HIT_DAMAGE = 20
+private const val BOT_MIN_DELAY_MS = 4_000L
+private const val BOT_MAX_DELAY_EXCLUSIVE_MS = 7_001L
+
+enum class Fighter { PLAYER, BOT }
 
 enum class Operation(val symbol: String) {
     ADD("+"), SUBTRACT("−"), MULTIPLY("×")
@@ -40,7 +44,7 @@ fun generateQuestion(previous: Question? = null, random: Random = Random.Default
     return if (fallback != previous) fallback else Question(1, Operation.ADD, 1)
 }
 
-enum class BattlePhase { HOME, ANSWERING, WINDUP, IMPACT, KO, VICTORY }
+enum class BattlePhase { HOME, ANSWERING, WINDUP, IMPACT, KO, RESULT }
 
 data class PhaseKey(val battleId: Long, val questionId: Long, val phase: BattlePhase)
 
@@ -51,6 +55,9 @@ data class BattleState(
     val question: Question? = null,
     val input: String = "",
     val wrongAnswer: Boolean = false,
+    val attacker: Fighter? = null,
+    val winner: Fighter? = null,
+    val botRemainingMs: Long = 0L,
     val battleId: Long = 0,
     val questionId: Long = 0
 ) {
@@ -58,11 +65,12 @@ data class BattleState(
         get() = PhaseKey(battleId, questionId, phase)
 }
 
-fun newBattle(previous: BattleState) = BattleState(
+fun newBattle(previous: BattleState, random: Random = Random.Default) = BattleState(
     phase = BattlePhase.ANSWERING,
-    question = generateQuestion(previous.question),
+    question = generateQuestion(previous.question, random),
     battleId = previous.battleId + 1,
-    questionId = 1
+    questionId = 1,
+    botRemainingMs = random.nextLong(BOT_MIN_DELAY_MS, BOT_MAX_DELAY_EXCLUSIVE_MS)
 )
 
 fun enterDigit(state: BattleState, digit: Int): BattleState {
@@ -83,35 +91,60 @@ fun clearInput(state: BattleState) = if (state.phase == BattlePhase.ANSWERING) {
     state.copy(input = "", wrongAnswer = false)
 } else state
 
+fun claimQuestion(state: BattleState, expected: PhaseKey, actor: Fighter): BattleState {
+    if (state.key != expected || state.phase != BattlePhase.ANSWERING) return state
+    if (state.playerHp <= 0 || state.opponentHp <= 0) return state
+    return state.copy(
+        phase = BattlePhase.WINDUP,
+        attacker = actor,
+        input = "",
+        wrongAnswer = false
+    )
+}
+
 fun submitAnswer(state: BattleState): BattleState {
     if (state.phase != BattlePhase.ANSWERING || state.input.isEmpty()) return state
     val question = state.question ?: return state
     return if (state.input.toIntOrNull() == question.answer) {
-        state.copy(phase = BattlePhase.WINDUP, input = "", wrongAnswer = false)
+        claimQuestion(state, state.key, Fighter.PLAYER)
     } else {
         state.copy(input = "", wrongAnswer = true)
     }
 }
 
-fun advancePhase(state: BattleState, expected: PhaseKey): BattleState {
+fun advancePhase(
+    state: BattleState,
+    expected: PhaseKey,
+    random: Random = Random.Default
+): BattleState {
     if (state.key != expected) return state
     return when (state.phase) {
-        BattlePhase.WINDUP -> state.copy(
-            phase = BattlePhase.IMPACT,
-            opponentHp = (state.opponentHp - HIT_DAMAGE).coerceAtLeast(0)
-        )
-        BattlePhase.IMPACT -> if (state.opponentHp == 0) {
-            state.copy(phase = BattlePhase.KO)
-        } else {
-            state.copy(
+        BattlePhase.WINDUP -> {
+            val hitState = when (state.attacker) {
+                Fighter.PLAYER -> state.copy(
+                    opponentHp = (state.opponentHp - HIT_DAMAGE).coerceAtLeast(0)
+                )
+                Fighter.BOT -> state.copy(
+                    playerHp = (state.playerHp - HIT_DAMAGE).coerceAtLeast(0)
+                )
+                null -> return state
+            }
+            hitState.copy(phase = BattlePhase.IMPACT)
+        }
+        BattlePhase.IMPACT -> when {
+            state.opponentHp == 0 -> state.copy(phase = BattlePhase.KO, winner = Fighter.PLAYER)
+            state.playerHp == 0 -> state.copy(phase = BattlePhase.KO, winner = Fighter.BOT)
+            else -> state.copy(
                 phase = BattlePhase.ANSWERING,
-                question = generateQuestion(state.question),
+                question = generateQuestion(state.question, random),
                 questionId = state.questionId + 1,
                 input = "",
-                wrongAnswer = false
+                wrongAnswer = false,
+                attacker = null,
+                botRemainingMs = random.nextLong(BOT_MIN_DELAY_MS, BOT_MAX_DELAY_EXCLUSIVE_MS)
             )
         }
-        BattlePhase.KO -> state.copy(phase = BattlePhase.VICTORY)
+        BattlePhase.KO -> state.copy(phase = BattlePhase.RESULT)
         else -> state
     }
 }

@@ -28,7 +28,6 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.rotate
-import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -36,6 +35,7 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.droidnova.mathfight.game.BattlePhase
 import com.droidnova.mathfight.game.BattleState
+import com.droidnova.mathfight.game.Fighter
 import com.droidnova.mathfight.game.STARTING_HP
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
@@ -55,7 +55,7 @@ fun MathFightApp(
     BackHandler(enabled = state.phase != BattlePhase.HOME, onBack = onReturnHome)
     when (state.phase) {
         BattlePhase.HOME -> HomeScreen(onStart)
-        BattlePhase.VICTORY -> VictoryScreen(onRestart)
+        BattlePhase.RESULT -> ResultScreen(state.winner, onRestart)
         else -> BattleScreen(
             state = state,
             isResumed = isResumed,
@@ -90,14 +90,17 @@ private fun HomeScreen(onStart: () -> Unit) {
 }
 
 @Composable
-private fun VictoryScreen(onRestart: () -> Unit) {
+private fun ResultScreen(winner: Fighter?, onRestart: () -> Unit) {
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            Text("You win!", style = MaterialTheme.typography.displaySmall)
+            Text(
+                if (winner == Fighter.PLAYER) "You win!" else "You lose!",
+                style = MaterialTheme.typography.displaySmall
+            )
             Button(
                 onClick = onRestart,
                 modifier = Modifier.padding(top = 28.dp).heightIn(min = 48.dp)
@@ -164,7 +167,7 @@ private fun HealthRow(state: BattleState, isResumed: Boolean) {
         horizontalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         HealthBar("Player", state.playerHp, isResumed, Modifier.weight(1f))
-        HealthBar("Opponent", state.opponentHp, isResumed, Modifier.weight(1f))
+        HealthBar("Bot", state.opponentHp, isResumed, Modifier.weight(1f))
     }
 }
 
@@ -186,22 +189,36 @@ private fun HealthBar(label: String, hp: Int, isResumed: Boolean, modifier: Modi
 @Composable
 private fun FighterArena(state: BattleState, isResumed: Boolean, modifier: Modifier = Modifier) {
     val playerMotion = remember { Animatable(0f) }
-    val opponentMotion = remember { Animatable(0f) }
+    val botMotion = remember { Animatable(0f) }
     val animationKey = state.key
     LaunchedEffect(animationKey, isResumed) {
-        playerMotion.snapTo(if (state.phase == BattlePhase.IMPACT) 1f else 0f)
-        opponentMotion.snapTo(0f)
+        playerMotion.snapTo(
+            if (state.phase == BattlePhase.IMPACT && state.attacker == Fighter.PLAYER) 1f else 0f
+        )
+        botMotion.snapTo(
+            if (state.phase == BattlePhase.IMPACT && state.attacker == Fighter.BOT) 1f else 0f
+        )
         if (!isResumed) return@LaunchedEffect
         when (state.phase) {
-            BattlePhase.WINDUP -> playerMotion.animateTo(1f, tween(180))
+            BattlePhase.WINDUP -> when (state.attacker) {
+                Fighter.PLAYER -> playerMotion.animateTo(1f, tween(180))
+                Fighter.BOT -> botMotion.animateTo(1f, tween(180))
+                null -> Unit
+            }
             BattlePhase.IMPACT -> coroutineScope {
-                launch { playerMotion.animateTo(0f, tween(320)) }
+                val attackerMotion = if (state.attacker == Fighter.PLAYER) playerMotion else botMotion
+                val defenderMotion = if (state.attacker == Fighter.PLAYER) botMotion else playerMotion
+                launch { attackerMotion.animateTo(0f, tween(320)) }
                 launch {
-                    opponentMotion.animateTo(1f, tween(120))
-                    opponentMotion.animateTo(0f, tween(200))
+                    defenderMotion.animateTo(1f, tween(120))
+                    defenderMotion.animateTo(0f, tween(200))
                 }
             }
-            BattlePhase.KO -> opponentMotion.animateTo(1f, tween(600))
+            BattlePhase.KO -> when (state.winner) {
+                Fighter.PLAYER -> botMotion.animateTo(1f, tween(600))
+                Fighter.BOT -> playerMotion.animateTo(1f, tween(600))
+                null -> Unit
+            }
             else -> Unit
         }
     }
@@ -210,42 +227,57 @@ private fun FighterArena(state: BattleState, isResumed: Boolean, modifier: Modif
     val opponentColor = MaterialTheme.colorScheme.tertiary
     Canvas(
         modifier = modifier.semantics {
-            contentDescription = "Player fighter facing opponent fighter"
+            contentDescription = "Player fighter facing bot fighter"
         }
     ) {
         val ground = size.height * 0.88f
         val figureHeight = size.height * 0.64f
-        val lunge = size.width * 0.16f * playerMotion.value
-        val recoil = size.width * 0.07f * opponentMotion.value
+        val playerAttacking = state.attacker == Fighter.PLAYER
+        val botAttacking = state.attacker == Fighter.BOT
+        val playerX = size.width * 0.25f + size.width * playerMotion.value *
+            (if (playerAttacking) 0.16f else -0.07f)
+        val botX = size.width * 0.75f + size.width * botMotion.value *
+            (if (botAttacking) -0.16f else 0.07f)
         drawLine(
             color = Color.Gray.copy(alpha = 0.35f),
             start = Offset(size.width * 0.05f, ground),
             end = Offset(size.width * 0.95f, ground),
             strokeWidth = 3f
         )
-        translate(left = lunge) {
+        rotate(
+            degrees = -72f * playerMotion.value.takeIf {
+                state.phase == BattlePhase.KO && state.winner == Fighter.BOT
+            }.orZero(),
+            pivot = Offset(playerX, ground)
+        ) {
             drawFighter(
-                centerX = size.width * 0.25f,
+                centerX = playerX,
                 groundY = ground,
                 height = figureHeight,
-                color = playerColor,
+                color = if (state.phase == BattlePhase.IMPACT && botAttacking && playerMotion.value > 0f) Color.White else playerColor,
                 facingRight = true,
-                striking = playerMotion.value
+                striking = if (playerAttacking) playerMotion.value else 0f
             )
         }
-        val opponentX = size.width * 0.75f + recoil
-        rotate(degrees = 72f * opponentMotion.value, pivot = Offset(opponentX, ground)) {
+        rotate(
+            degrees = 72f * botMotion.value.takeIf {
+                state.phase == BattlePhase.KO && state.winner == Fighter.PLAYER
+            }.orZero(),
+            pivot = Offset(botX, ground)
+        ) {
             drawFighter(
-                centerX = opponentX,
+                centerX = botX,
                 groundY = ground,
                 height = figureHeight,
-                color = if (state.phase == BattlePhase.IMPACT && opponentMotion.value > 0f) Color.White else opponentColor,
+                color = if (state.phase == BattlePhase.IMPACT && playerAttacking && botMotion.value > 0f) Color.White else opponentColor,
                 facingRight = false,
-                striking = 0f
+                striking = if (botAttacking) botMotion.value else 0f
             )
         }
     }
 }
+
+private fun Float?.orZero(): Float = this ?: 0f
 
 private fun DrawScope.drawFighter(
     centerX: Float,
