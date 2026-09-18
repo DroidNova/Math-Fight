@@ -1,6 +1,6 @@
 # Math Fight
 
-Math Fight is an offline Android game prototype in which solving math questions triggers fighter attacks. The current **Milestone 2** build supports a complete battle against an offline bot through KO and restart.
+Math Fight is an offline Android game prototype in which solving math questions triggers fighter attacks. The current **Milestone 3** build adds combat animations, offline punch/KO audio, hit haptics, and sound/vibration controls to the complete offline bot battle.
 
 ## Local setup
 

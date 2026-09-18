@@ -3,6 +3,7 @@ package com.droidnova.mathfight.ui.battle
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.keyframes
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
@@ -12,13 +13,13 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
-import androidx.compose.foundation.layout.weight
 import androidx.compose.material3.Button
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
@@ -28,6 +29,9 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.rotate
+import androidx.compose.ui.graphics.drawscope.translate
+import androidx.compose.ui.graphics.lerp
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -37,6 +41,7 @@ import com.droidnova.mathfight.game.BattlePhase
 import com.droidnova.mathfight.game.BattleState
 import com.droidnova.mathfight.game.Fighter
 import com.droidnova.mathfight.game.STARTING_HP
+import com.droidnova.mathfight.game.PhaseKey
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 
@@ -44,6 +49,11 @@ import kotlinx.coroutines.launch
 fun MathFightApp(
     state: BattleState,
     isResumed: Boolean,
+    impactToken: PhaseKey?,
+    consumeImpact: (PhaseKey) -> Boolean,
+    settings: FeedbackSettings,
+    onSound: (Boolean) -> Unit,
+    onVibration: (Boolean) -> Unit,
     onStart: () -> Unit,
     onRestart: () -> Unit,
     onDigit: (Int) -> Unit,
@@ -54,11 +64,16 @@ fun MathFightApp(
 ) {
     BackHandler(enabled = state.phase != BattlePhase.HOME, onBack = onReturnHome)
     when (state.phase) {
-        BattlePhase.HOME -> HomeScreen(onStart)
+        BattlePhase.HOME -> HomeScreen(onStart, settings, onSound, onVibration)
         BattlePhase.RESULT -> ResultScreen(state.winner, onRestart)
         else -> BattleScreen(
             state = state,
             isResumed = isResumed,
+            impactToken = impactToken,
+            consumeImpact = consumeImpact,
+            settings = settings,
+            onSound = onSound,
+            onVibration = onVibration,
             onDigit = onDigit,
             onBackspace = onBackspace,
             onClear = onClear,
@@ -68,7 +83,8 @@ fun MathFightApp(
 }
 
 @Composable
-private fun HomeScreen(onStart: () -> Unit) {
+private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
+                       onSound: (Boolean) -> Unit, onVibration: (Boolean) -> Unit) {
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
@@ -85,6 +101,7 @@ private fun HomeScreen(onStart: () -> Unit) {
             Button(onClick = onStart, modifier = Modifier.heightIn(min = 48.dp)) {
                 Text("Start Battle")
             }
+            FeedbackControls(settings, onSound, onVibration)
         }
     }
 }
@@ -115,6 +132,11 @@ private fun ResultScreen(winner: Fighter?, onRestart: () -> Unit) {
 private fun BattleScreen(
     state: BattleState,
     isResumed: Boolean,
+    impactToken: PhaseKey?,
+    consumeImpact: (PhaseKey) -> Boolean,
+    settings: FeedbackSettings,
+    onSound: (Boolean) -> Unit,
+    onVibration: (Boolean) -> Unit,
     onDigit: (Int) -> Unit,
     onBackspace: () -> Unit,
     onClear: () -> Unit,
@@ -127,9 +149,12 @@ private fun BattleScreen(
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             HealthRow(state, isResumed)
+            FeedbackControls(settings, onSound, onVibration)
             FighterArena(
                 state = state,
                 isResumed = isResumed,
+                impactToken = impactToken,
+                consumeImpact = consumeImpact,
                 modifier = Modifier.fillMaxWidth().weight(0.34f)
             )
             Text(
@@ -161,6 +186,19 @@ private fun BattleScreen(
 }
 
 @Composable
+private fun FeedbackControls(settings: FeedbackSettings, onSound: (Boolean) -> Unit,
+                             onVibration: (Boolean) -> Unit) {
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        TextButton(onClick = { onSound(!settings.sound) }) {
+            Text("Sound: ${if (settings.sound) "On" else "Off"}")
+        }
+        TextButton(onClick = { onVibration(!settings.vibration) }) {
+            Text("Vibration: ${if (settings.vibration) "On" else "Off"}")
+        }
+    }
+}
+
+@Composable
 private fun HealthRow(state: BattleState, isResumed: Boolean) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -187,10 +225,34 @@ private fun HealthBar(label: String, hp: Int, isResumed: Boolean, modifier: Modi
 }
 
 @Composable
-private fun FighterArena(state: BattleState, isResumed: Boolean, modifier: Modifier = Modifier) {
+private fun FighterArena(state: BattleState, isResumed: Boolean, impactToken: PhaseKey?,
+                         consumeImpact: (PhaseKey) -> Boolean,
+                         modifier: Modifier = Modifier) {
     val playerMotion = remember { Animatable(0f) }
     val botMotion = remember { Animatable(0f) }
+    val flash = remember { Animatable(0f) }
+    val burst = remember { Animatable(1f) }
+    val shake = remember { Animatable(0f) }
     val animationKey = state.key
+    LaunchedEffect(animationKey, impactToken, isResumed) {
+        flash.snapTo(0f)
+        burst.snapTo(1f)
+        shake.snapTo(0f)
+        if (!isResumed || state.phase != BattlePhase.IMPACT || impactToken != animationKey) {
+            return@LaunchedEffect
+        }
+        if (!consumeImpact(animationKey)) return@LaunchedEffect
+        coroutineScope {
+            launch { flash.snapTo(1f); flash.animateTo(0f, tween(100)) }
+            launch { burst.snapTo(0f); burst.animateTo(1f, tween(140)) }
+            launch {
+                shake.animateTo(0f, keyframes {
+                    durationMillis = 160
+                    0f at 0; -1f at 25; 1f at 55; -0.6f at 85; 0.3f at 120; 0f at 160
+                })
+            }
+        }
+    }
     LaunchedEffect(animationKey, isResumed) {
         playerMotion.snapTo(
             if (state.phase == BattlePhase.IMPACT && state.attacker == Fighter.PLAYER) 1f else 0f
@@ -210,13 +272,13 @@ private fun FighterArena(state: BattleState, isResumed: Boolean, modifier: Modif
                 val defenderMotion = if (state.attacker == Fighter.PLAYER) botMotion else playerMotion
                 launch { attackerMotion.animateTo(0f, tween(320)) }
                 launch {
-                    defenderMotion.animateTo(1f, tween(120))
-                    defenderMotion.animateTo(0f, tween(200))
+                    defenderMotion.animateTo(1f, tween(70))
+                    defenderMotion.animateTo(0f, tween(250))
                 }
             }
             BattlePhase.KO -> when (state.winner) {
-                Fighter.PLAYER -> botMotion.animateTo(1f, tween(600))
-                Fighter.BOT -> playerMotion.animateTo(1f, tween(600))
+                Fighter.PLAYER -> botMotion.animateTo(1f, tween(420))
+                Fighter.BOT -> playerMotion.animateTo(1f, tween(420))
                 null -> Unit
             }
             else -> Unit
@@ -226,18 +288,23 @@ private fun FighterArena(state: BattleState, isResumed: Boolean, modifier: Modif
     val playerColor = MaterialTheme.colorScheme.primary
     val opponentColor = MaterialTheme.colorScheme.tertiary
     Canvas(
-        modifier = modifier.semantics {
+        modifier = modifier.clipToBounds().semantics {
             contentDescription = "Player fighter facing bot fighter"
         }
     ) {
         val ground = size.height * 0.88f
-        val figureHeight = size.height * 0.64f
+        // Width bound leaves room for an outward fall, even in a tall/narrow arena.
+        val figureHeight = minOf(size.height * 0.64f, size.width * 0.22f)
         val playerAttacking = state.attacker == Fighter.PLAYER
         val botAttacking = state.attacker == Fighter.BOT
-        val playerX = size.width * 0.25f + size.width * playerMotion.value *
-            (if (playerAttacking) 0.16f else -0.07f)
-        val botX = size.width * 0.75f + size.width * botMotion.value *
-            (if (botAttacking) -0.16f else 0.07f)
+        val combatPose = state.phase == BattlePhase.WINDUP || state.phase == BattlePhase.IMPACT
+        val reach = (size.width * 0.5f - figureHeight * 0.67f).coerceAtLeast(0f)
+        val playerX = size.width * 0.25f + if (combatPose) playerMotion.value *
+            (if (playerAttacking) reach else -figureHeight * 0.12f) else 0f
+        val botX = size.width * 0.75f + if (combatPose) botMotion.value *
+            (if (botAttacking) -reach else figureHeight * 0.12f) else 0f
+        val showImpact = isResumed && impactToken == animationKey && state.phase == BattlePhase.IMPACT
+        translate(left = if (showImpact) shake.value * 3.dp.toPx() else 0f) {
         drawLine(
             color = Color.Gray.copy(alpha = 0.35f),
             start = Offset(size.width * 0.05f, ground),
@@ -247,32 +314,45 @@ private fun FighterArena(state: BattleState, isResumed: Boolean, modifier: Modif
         rotate(
             degrees = -72f * playerMotion.value.takeIf {
                 state.phase == BattlePhase.KO && state.winner == Fighter.BOT
-            }.orZero(),
+            }.orZero() + if (combatPose && playerAttacking) 10f * playerMotion.value else 0f,
             pivot = Offset(playerX, ground)
         ) {
             drawFighter(
                 centerX = playerX,
                 groundY = ground,
                 height = figureHeight,
-                color = if (state.phase == BattlePhase.IMPACT && botAttacking && playerMotion.value > 0f) Color.White else playerColor,
+                color = lerp(playerColor, Color.White, if (showImpact && botAttacking) flash.value else 0f),
                 facingRight = true,
-                striking = if (playerAttacking) playerMotion.value else 0f
+                striking = if (combatPose && playerAttacking) playerMotion.value else 0f
             )
         }
         rotate(
             degrees = 72f * botMotion.value.takeIf {
                 state.phase == BattlePhase.KO && state.winner == Fighter.PLAYER
-            }.orZero(),
+            }.orZero() - if (combatPose && botAttacking) 10f * botMotion.value else 0f,
             pivot = Offset(botX, ground)
         ) {
             drawFighter(
                 centerX = botX,
                 groundY = ground,
                 height = figureHeight,
-                color = if (state.phase == BattlePhase.IMPACT && playerAttacking && botMotion.value > 0f) Color.White else opponentColor,
+                color = lerp(opponentColor, Color.White, if (showImpact && playerAttacking) flash.value else 0f),
                 facingRight = false,
-                striking = if (botAttacking) botMotion.value else 0f
+                striking = if (combatPose && botAttacking) botMotion.value else 0f
             )
+        }
+        if (showImpact && burst.value < 1f) {
+            val contact = Offset(size.width * (if (playerAttacking) 0.75f else 0.25f),
+                ground - figureHeight * 0.66f)
+            val radius = figureHeight * (0.06f + 0.18f * burst.value)
+            repeat(6) { ray ->
+                rotate(ray * 60f, contact) {
+                    drawLine(Color.White.copy(alpha = 1f - burst.value),
+                        contact + Offset(radius * 0.4f, 0f), contact + Offset(radius, 0f),
+                        strokeWidth = 2.dp.toPx())
+                }
+            }
+        }
         }
     }
 }
