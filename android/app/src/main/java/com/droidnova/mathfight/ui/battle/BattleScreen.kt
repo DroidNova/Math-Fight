@@ -20,6 +20,7 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
@@ -61,10 +62,26 @@ fun MathFightApp(
     onClear: () -> Unit,
     onSubmit: () -> Unit,
     onReturnHome: () -> Unit
+    ,debugConnection: Boolean,
+    serverUrl: String,
+    connectionStatus: BattleViewModel.ConnectionStatus,
+    connectionMessage: String,
+    onServerUrl: (String) -> Unit,
+    onConnect: () -> Unit,
+    onDisconnect: () -> Unit,
+    roomCodeInput: String,
+    room: RoomInfo?,
+    roomError: String,
+    onRoomCode: (String) -> Unit,
+    onCreateRoom: () -> Unit,
+    onJoinRoom: () -> Unit,
+    onLeaveRoom: () -> Unit
 ) {
     BackHandler(enabled = state.phase != BattlePhase.HOME, onBack = onReturnHome)
     when (state.phase) {
-        BattlePhase.HOME -> HomeScreen(onStart, settings, onSound, onVibration)
+        BattlePhase.HOME -> HomeScreen(onStart, settings, onSound, onVibration,
+            debugConnection, serverUrl, connectionStatus, connectionMessage, onServerUrl, onConnect, onDisconnect,
+            roomCodeInput, room, roomError, onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom)
         BattlePhase.RESULT -> ResultScreen(state.winner, onRestart)
         else -> BattleScreen(
             state = state,
@@ -84,7 +101,13 @@ fun MathFightApp(
 
 @Composable
 private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
-                       onSound: (Boolean) -> Unit, onVibration: (Boolean) -> Unit) {
+                       onSound: (Boolean) -> Unit, onVibration: (Boolean) -> Unit,
+                       debugConnection: Boolean, serverUrl: String,
+                       connectionStatus: BattleViewModel.ConnectionStatus, connectionMessage: String,
+                       onServerUrl: (String) -> Unit, onConnect: () -> Unit, onDisconnect: () -> Unit,
+                       roomCodeInput: String, room: RoomInfo?, roomError: String,
+                       onRoomCode: (String) -> Unit, onCreateRoom: () -> Unit,
+                       onJoinRoom: () -> Unit, onLeaveRoom: () -> Unit) {
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
@@ -92,6 +115,11 @@ private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text("Math Fight", style = MaterialTheme.typography.displaySmall)
+            if (debugConnection) {
+                ConnectionCheckPanel(serverUrl, connectionStatus, connectionMessage,
+                    onServerUrl, onConnect, onDisconnect, roomCodeInput, room, roomError,
+                    onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom)
+            }
             Text(
                 "Solve. Strike. Win.",
                 modifier = Modifier.padding(top = 12.dp, bottom = 32.dp),
@@ -181,6 +209,77 @@ private fun BattleScreen(
                 onSubmit = onSubmit,
                 modifier = Modifier.fillMaxWidth().weight(0.66f)
             )
+        }
+    }
+}
+
+@Composable
+private fun ConnectionCheckPanel(
+    serverUrl: String,
+    status: BattleViewModel.ConnectionStatus,
+    message: String,
+    onServerUrl: (String) -> Unit,
+    onConnect: () -> Unit,
+    onDisconnect: () -> Unit,
+    roomCodeInput: String,
+    room: RoomInfo?,
+    roomError: String,
+    onRoomCode: (String) -> Unit,
+    onCreateRoom: () -> Unit,
+    onJoinRoom: () -> Unit,
+    onLeaveRoom: () -> Unit
+) {
+    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
+        Text("Connection check", style = MaterialTheme.typography.titleMedium)
+        OutlinedTextField(
+            value = serverUrl,
+            onValueChange = onServerUrl,
+            singleLine = true,
+            label = { Text("Server URL") },
+            modifier = Modifier.fillMaxWidth().padding(top = 6.dp)
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 4.dp)) {
+            Button(onClick = onConnect, enabled = status != BattleViewModel.ConnectionStatus.CONNECTING) {
+                Text("Connect")
+            }
+            OutlinedButton(onClick = onDisconnect) { Text("Disconnect") }
+        }
+        if (status != BattleViewModel.ConnectionStatus.IDLE || message.isNotEmpty()) {
+            Text("${status.name.lowercase().replace('_', ' ')}: $message",
+                style = MaterialTheme.typography.bodySmall,
+                color = if (status == BattleViewModel.ConnectionStatus.ERROR)
+                    MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(top = 4.dp))
+        }
+        if (status == BattleViewModel.ConnectionStatus.CONNECTED) {
+            if (room == null) {
+                Button(onClick = onCreateRoom, modifier = Modifier.padding(top = 8.dp)) {
+                    Text("Create Room")
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    OutlinedTextField(
+                        value = roomCodeInput,
+                        onValueChange = onRoomCode,
+                        singleLine = true,
+                        label = { Text("Room code") },
+                        modifier = Modifier.weight(1f)
+                    )
+                    Button(onClick = onJoinRoom, modifier = Modifier.align(Alignment.CenterVertically)) {
+                        Text("Join Room")
+                    }
+                }
+            } else {
+                Text("Room: ${room.code}", style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.padding(top = 8.dp))
+                Text("Role: ${room.role}")
+                Text("Players: ${room.playerCount}/2")
+                Text(if (room.playerCount == 2) "Both players connected" else "Waiting for opponent…")
+                OutlinedButton(onClick = onLeaveRoom) { Text("Leave Room") }
+            }
+            if (roomError.isNotEmpty()) {
+                Text(roomError, color = MaterialTheme.colorScheme.error,
+                    style = MaterialTheme.typography.bodySmall)
+            }
         }
     }
 }

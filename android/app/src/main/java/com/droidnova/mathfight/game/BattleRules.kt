@@ -4,8 +4,8 @@ import kotlin.random.Random
 
 const val STARTING_HP = 100
 const val HIT_DAMAGE = 20
-private const val BOT_MIN_DELAY_MS = 4_000L
-private const val BOT_MAX_DELAY_EXCLUSIVE_MS = 7_001L
+private const val BOT_MIN_DELAY_MS = 1_500L
+private const val BOT_MAX_DELAY_EXCLUSIVE_MS = 3_501L
 
 enum class Fighter { PLAYER, BOT }
 

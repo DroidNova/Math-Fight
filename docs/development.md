@@ -12,6 +12,12 @@ Sound and vibration default on. Their separate in-memory ViewModel preferences s
 
 Device verification of this milestone is pending, including animation quality, phone-size layout, audio, haptic support/settings, lifecycle transitions, and airplane-mode play. No automated tests were added or run.
 
+## Milestone 4
+
+The debug build adds a local Connection check with an editable server URL, connect/disconnect controls, bounded reconnects, stale-callback protection, and a three-second acknowledgement timeout. The socket is owned by the activity-scoped ViewModel and is disconnected on backgrounding; it reconnects on foreground only when the user left the connection requested. Offline battle behavior is unchanged.
+
+Run the server from `server/` with `npm run start:dev`. Use `ipconfig` to find the laptop Wi-Fi IPv4 and enter `http://<laptop-ip>:3000` on a phone using the same Wi-Fi; use `http://10.0.2.2:3000` from an emulator. A private-network Windows Firewall rule may be needed for Node. The server also exposes `GET /health`.
+
 Build verification: `android/` -> `.\gradlew.bat :app:assembleDebug` succeeded on Windows for Milestone 3. The initial sandbox cache-access blocker and initial misplaced-resource compilation error were resolved; package/build configuration was preserved.
 
 Manual checklist for Milestone 3:
@@ -53,3 +59,7 @@ Build result: blocked before compilation because the environment proxy returned 
 - [ ] The complete loop works in airplane mode.
 
 Phone verification is pending.
+
+## Milestone 5
+
+The local server keeps ephemeral two-player rooms with six-character uppercase codes. The debug Connection check can create, join, leave, and display host/guest lobby state; room membership is cleared on disconnect, Back, URL changes, and backgrounding. Start Battle remains the offline bot mode.

@@ -1,6 +1,9 @@
 package com.droidnova.mathfight
 
 import android.os.Bundle
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.view.HapticFeedbackConstants
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -34,6 +37,12 @@ class MainActivity : ComponentActivity() {
             val state by battleViewModel.state.collectAsStateWithLifecycle()
             val isResumed by battleViewModel.isResumed.collectAsStateWithLifecycle()
             val settings by battleViewModel.settings.collectAsStateWithLifecycle()
+            val serverUrl by battleViewModel.serverUrl.collectAsStateWithLifecycle()
+            val connectionStatus by battleViewModel.connectionStatus.collectAsStateWithLifecycle()
+            val connectionMessage by battleViewModel.connectionMessage.collectAsStateWithLifecycle()
+            val roomCodeInput by battleViewModel.roomCodeInput.collectAsStateWithLifecycle()
+            val room by battleViewModel.room.collectAsStateWithLifecycle()
+            val roomError by battleViewModel.roomError.collectAsStateWithLifecycle()
             val view = LocalView.current
             var impactToken by remember { mutableStateOf<PhaseKey?>(null) }
             LaunchedEffect(view) {
@@ -64,6 +73,20 @@ class MainActivity : ComponentActivity() {
                     impactToken = impactToken,
                     consumeImpact = battleViewModel::consumeImpact,
                     settings = settings,
+                    debugConnection = (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0,
+                    serverUrl = serverUrl,
+                    connectionStatus = connectionStatus,
+                    connectionMessage = connectionMessage,
+                    onServerUrl = battleViewModel::setServerUrl,
+                    onConnect = ::requestConnection,
+                    onDisconnect = battleViewModel::disconnect,
+                    roomCodeInput = roomCodeInput,
+                    room = room,
+                    roomError = roomError,
+                    onRoomCode = battleViewModel::setRoomCodeInput,
+                    onCreateRoom = battleViewModel::createRoom,
+                    onJoinRoom = battleViewModel::joinRoom,
+                    onLeaveRoom = battleViewModel::leaveRoom,
                     onSound = { enabled ->
                         battleViewModel.setSound(enabled)
                         if (!enabled) audio.stop()
@@ -84,10 +107,12 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         battleViewModel.setResumed(true)
+        battleViewModel.setConnectionForeground(true)
     }
 
     override fun onPause() {
         battleViewModel.setResumed(false)
+        battleViewModel.setConnectionForeground(false)
         audio.stop()
         super.onPause()
     }
@@ -96,4 +121,23 @@ class MainActivity : ComponentActivity() {
         audio.release()
         super.onDestroy()
     }
+
+    private fun requestConnection() {
+        if (Build.VERSION.SDK_INT >= 37 &&
+            checkSelfPermission(Manifest.permission.ACCESS_LOCAL_NETWORK) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.ACCESS_LOCAL_NETWORK), LOCAL_NETWORK_REQUEST)
+        } else {
+            battleViewModel.connect()
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (requestCode == LOCAL_NETWORK_REQUEST) {
+            if (grantResults.firstOrNull() == PackageManager.PERMISSION_GRANTED) battleViewModel.connect()
+            else battleViewModel.connectionPermissionDenied()
+        }
+    }
+
+    companion object { private const val LOCAL_NETWORK_REQUEST = 7301 }
 }

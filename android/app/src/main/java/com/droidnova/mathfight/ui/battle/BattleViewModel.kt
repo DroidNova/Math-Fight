@@ -1,6 +1,8 @@
 package com.droidnova.mathfight.ui.battle
 
 import android.os.SystemClock
+import android.os.Handler
+import android.os.Looper
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.droidnova.mathfight.game.BattlePhase
@@ -27,10 +29,14 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
+import io.socket.client.IO
+import io.socket.client.Socket
+import org.json.JSONObject
 
 data class FeedbackSettings(val sound: Boolean = true, val vibration: Boolean = true)
 enum class FeedbackKind { HIT, KO }
 data class CombatFeedback(val token: PhaseKey, val kind: FeedbackKind)
+data class RoomInfo(val code: String, val role: String, val playerCount: Int)
 
 class BattleViewModel : ViewModel() {
     private val mutableState = MutableStateFlow(BattleState())
@@ -49,6 +55,30 @@ class BattleViewModel : ViewModel() {
     private var consumedToken: PhaseKey? = null
     private var consumedImpact: PhaseKey? = null
 
+    enum class ConnectionStatus { IDLE, CONNECTING, CONNECTED, DISCONNECTED, ERROR }
+    private val mutableServerUrl = MutableStateFlow("http://192.168.1.9:3000")
+    val serverUrl = mutableServerUrl.asStateFlow()
+    private val mutableConnectionStatus = MutableStateFlow(ConnectionStatus.IDLE)
+    val connectionStatus = mutableConnectionStatus.asStateFlow()
+    private val mutableConnectionMessage = MutableStateFlow("")
+    val connectionMessage = mutableConnectionMessage.asStateFlow()
+    private var socket: Socket? = null
+    private var connectionGeneration = 0L
+    private var wantsConnection = false
+    private var connectionForeground = false
+    private var reconnectJob: Job? = null
+    private var acknowledgementJob: Job? = null
+    private var reconnectAttempt = 0
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private val mutableRoomCodeInput = MutableStateFlow("")
+    val roomCodeInput = mutableRoomCodeInput.asStateFlow()
+    private val mutableRoom = MutableStateFlow<RoomInfo?>(null)
+    val room = mutableRoom.asStateFlow()
+    private val mutableRoomError = MutableStateFlow("")
+    val roomError = mutableRoomError.asStateFlow()
+    private var roomOperationGeneration = 0L
+    private var roomRequestPending = false
+
     fun consumeImpact(token: PhaseKey): Boolean {
         if (!resumed.value || state.value.key != token || token.phase != BattlePhase.IMPACT ||
             consumedToken != token || consumedImpact == token) return false
@@ -58,6 +88,237 @@ class BattleViewModel : ViewModel() {
 
     fun setSound(enabled: Boolean) { mutableSettings.value = settings.value.copy(sound = enabled) }
     fun setVibration(enabled: Boolean) { mutableSettings.value = settings.value.copy(vibration = enabled) }
+
+    fun setServerUrl(value: String) {
+        if (value == mutableServerUrl.value) return
+        mutableServerUrl.value = value
+        leaveRoom()
+        wantsConnection = false
+        disposeSocket(ConnectionStatus.IDLE)
+    }
+
+    fun connect() {
+        val url = serverUrl.value.trim().trimEnd('/')
+        if (url.isEmpty()) {
+            mutableConnectionStatus.value = ConnectionStatus.ERROR
+            mutableConnectionMessage.value = "Enter a server URL"
+            return
+        }
+        wantsConnection = true
+        reconnectAttempt = 0
+        reconnectJob?.cancel()
+        leaveRoom()
+        disposeSocket(ConnectionStatus.IDLE)
+        openSocket(url)
+    }
+
+    fun disconnect() {
+        wantsConnection = false
+        reconnectJob?.cancel()
+        reconnectJob = null
+        leaveRoom()
+        disposeSocket(ConnectionStatus.DISCONNECTED)
+    }
+
+    fun setRoomCodeInput(value: String) {
+        mutableRoomCodeInput.value = value.uppercase().filter { it.isLetterOrDigit() }.take(6)
+        mutableRoomError.value = ""
+    }
+
+    fun createRoom() {
+        val current = socket
+        if (current?.connected() != true) return setRoomError("Connect to the server first")
+        val operation = ++roomOperationGeneration
+        roomRequestPending = true
+        current.emit("room:create", io.socket.client.Ack { args ->
+            mainHandler.post {
+                if (socket !== current || operation != roomOperationGeneration || args.isEmpty() || args[0] !is JSONObject) return@post
+                handleRoomAck(args[0] as JSONObject, operation)
+            }
+        })
+    }
+
+    fun joinRoom() {
+        val code = roomCodeInput.value
+        if (code.length != 6) return setRoomError("Enter a 6-character room code")
+        val current = socket
+        if (current?.connected() != true) return setRoomError("Connect to the server first")
+        val operation = ++roomOperationGeneration
+        roomRequestPending = true
+        current.emit("room:join", JSONObject().put("code", code), io.socket.client.Ack { args ->
+            mainHandler.post {
+                if (socket !== current || operation != roomOperationGeneration || args.isEmpty() || args[0] !is JSONObject) return@post
+                handleRoomAck(args[0] as JSONObject, operation)
+            }
+        })
+    }
+
+    fun leaveRoom() {
+        roomOperationGeneration++
+        roomRequestPending = false
+        val current = socket
+        if (current?.connected() == true && mutableRoom.value != null) {
+            current.emit("room:leave", io.socket.client.Ack { })
+        }
+        mutableRoom.value = null
+        mutableRoomCodeInput.value = ""
+        mutableRoomError.value = ""
+    }
+
+    private fun setRoomError(message: String) { mutableRoomError.value = message }
+
+    private fun handleRoomAck(response: JSONObject, operation: Long) {
+        if (operation != roomOperationGeneration) return
+        if (!response.optBoolean("ok", false)) {
+            roomRequestPending = false
+            setRoomError(response.optString("error", "Room request failed"))
+            return
+        }
+        roomRequestPending = false
+        response.optJSONObject("room")?.let(::updateRoom)
+    }
+
+    private fun updateRoom(value: JSONObject) {
+        mutableRoom.value = RoomInfo(
+            value.optString("code"),
+            value.optString("role").replaceFirstChar { it.uppercase() },
+            value.optInt("playerCount", 1)
+        )
+        mutableRoomError.value = ""
+    }
+
+    private fun clearRoomFromServer(message: String? = null) {
+        roomOperationGeneration++
+        roomRequestPending = false
+        mutableRoom.value = null
+        mutableRoomCodeInput.value = ""
+        if (!message.isNullOrBlank()) mutableRoomError.value = message
+    }
+
+    fun connectionPermissionDenied() {
+        wantsConnection = false
+        disposeSocket(ConnectionStatus.ERROR)
+        mutableConnectionMessage.value = "Local network permission denied"
+    }
+
+    fun setConnectionForeground(value: Boolean) {
+        connectionForeground = value
+        if (!value) {
+            if (wantsConnection) {
+                leaveRoom()
+                disposeSocket(ConnectionStatus.DISCONNECTED)
+            }
+        } else if (wantsConnection && socket == null) {
+            reconnectAttempt = 0
+            openSocket(serverUrl.value.trim().trimEnd('/'))
+        }
+    }
+
+    private fun openSocket(url: String) {
+        if (!connectionForeground) return
+        val generation = ++connectionGeneration
+        acknowledgementJob?.cancel()
+        mutableConnectionStatus.value = ConnectionStatus.CONNECTING
+        mutableConnectionMessage.value = "Connecting…"
+        val options = IO.Options().apply {
+            timeout = 5_000
+            reconnection = false
+        }
+        val created = try { IO.socket(url, options) } catch (error: Exception) {
+            mutableConnectionStatus.value = ConnectionStatus.ERROR
+            mutableConnectionMessage.value = error.message ?: "Invalid server URL"
+            return
+        }
+        socket = created
+        created.on("room:state") { args ->
+            mainHandler.post {
+                if (generation != connectionGeneration || socket !== created ||
+                    (!roomRequestPending && mutableRoom.value == null)) return@post
+                if (args.isNotEmpty() && args[0] is JSONObject) updateRoom(args[0] as JSONObject)
+            }
+        }
+        created.on("room:closed") { args ->
+            mainHandler.post {
+                if (generation != connectionGeneration || socket !== created) return@post
+                val message = if (args.isNotEmpty() && args[0] is JSONObject)
+                    (args[0] as JSONObject).optString("message") else "Room closed"
+                clearRoomFromServer(message)
+            }
+        }
+        created.on(Socket.EVENT_CONNECT) {
+            mainHandler.post {
+                if (generation != connectionGeneration || socket !== created) return@post
+                mutableConnectionStatus.value = ConnectionStatus.CONNECTED
+                mutableConnectionMessage.value = "Connected"
+                acknowledgementJob?.cancel()
+                acknowledgementJob = viewModelScope.launch {
+                    delay(3_000L)
+                    if (generation == connectionGeneration && socket === created &&
+                        mutableConnectionStatus.value == ConnectionStatus.CONNECTED) {
+                        mutableConnectionStatus.value = ConnectionStatus.ERROR
+                        mutableConnectionMessage.value = "Server acknowledgement timed out"
+                    }
+                }
+                created.emit("connection:check", io.socket.client.Ack { args ->
+                    mainHandler.post {
+                        if (generation != connectionGeneration || socket !== created) return@post
+                        acknowledgementJob?.cancel()
+                        if (args.isNotEmpty() && args[0] is JSONObject) {
+                            mutableConnectionMessage.value = (args[0] as JSONObject).optString("message", "Connected")
+                        } else {
+                            mutableConnectionMessage.value = "Math Fight server ready"
+                        }
+                    }
+                })
+            }
+        }
+        created.on(Socket.EVENT_CONNECT_ERROR) {
+            mainHandler.post {
+                if (generation != connectionGeneration || socket !== created) return@post
+                socket = null
+                clearRoomFromServer()
+                created.off()
+                created.disconnect()
+                mutableConnectionStatus.value = ConnectionStatus.ERROR
+                mutableConnectionMessage.value = "Unable to connect"
+                scheduleReconnect(generation)
+            }
+        }
+        created.on(Socket.EVENT_DISCONNECT) {
+            mainHandler.post {
+                if (generation != connectionGeneration || socket !== created) return@post
+                socket = null
+                clearRoomFromServer()
+                mutableConnectionStatus.value = ConnectionStatus.DISCONNECTED
+                mutableConnectionMessage.value = "Disconnected"
+                scheduleReconnect(generation)
+            }
+        }
+        created.connect()
+    }
+
+    private fun scheduleReconnect(generation: Long) {
+        if (!wantsConnection || !connectionForeground || generation != connectionGeneration || reconnectAttempt >= 3) return
+        reconnectJob?.cancel()
+        val delayMs = 1_000L shl reconnectAttempt++
+        reconnectJob = viewModelScope.launch {
+            delay(delayMs)
+            if (wantsConnection && connectionForeground && generation == connectionGeneration && socket == null) {
+                openSocket(serverUrl.value.trim().trimEnd('/'))
+            }
+        }
+    }
+
+    private fun disposeSocket(status: ConnectionStatus) {
+        connectionGeneration++
+        acknowledgementJob?.cancel()
+        val old = socket
+        socket = null
+        old?.off()
+        old?.disconnect()
+        mutableConnectionStatus.value = status
+        if (status != ConnectionStatus.ERROR) mutableConnectionMessage.value = ""
+    }
 
     // Survives Activity recreation; skipped or consumed feedback is never retried.
     fun consumeFeedback(event: CombatFeedback): Boolean {
@@ -166,6 +427,10 @@ class BattleViewModel : ViewModel() {
 
     override fun onCleared() {
         cancelBot()
+        wantsConnection = false
+        reconnectJob?.cancel()
+        leaveRoom()
+        disposeSocket(ConnectionStatus.IDLE)
         super.onCleared()
     }
 }
