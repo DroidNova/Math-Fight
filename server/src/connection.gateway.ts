@@ -10,7 +10,7 @@ type Difficulty = 'EASY' | 'STANDARD' | 'EXPERT';
 type Question = { matchId: string; questionId: number; left: number; operation: 'ADD' | 'SUBTRACT' | 'MULTIPLY' | 'DIVIDE'; right: number };
 type MatchPhase = 'SCHEDULED' | 'ANSWERING' | 'RESOLVING' | 'PAUSED' | 'FINISHED';
 type ScheduleReason = 'FIRST' | 'NEXT' | 'RESUME';
-type Match = { matchId: string; difficulty: Difficulty; ranked: boolean; hostName: string; guestName: string; question: Question; phase: MatchPhase; opensAt?: number; scheduleReason?: ScheduleReason; requiresReceipts: boolean; hostHp: number; guestHp: number; revision: number; attacker?: Role; winner?: Role; message?: string; startedAt: Date; timer?: NodeJS.Timeout; requests: Map<string, object>; received: Set<string>; rating?: object; hostProgression?: ReturnType<typeof progressionResult>; guestProgression?: ReturnType<typeof progressionResult> };
+type Match = { matchId: string; difficulty: Difficulty; ranked: boolean; hostName: string; guestName: string; question: Question; phase: MatchPhase; opensAt?: number; closesAt?: number; scheduleReason?: ScheduleReason; requiresReceipts: boolean; hostHp: number; guestHp: number; revision: number; attacker?: Role; winner?: Role; message?: string; startedAt: Date; timer?: NodeJS.Timeout; expiryTimer?: NodeJS.Timeout; requests: Map<string, object>; received: Set<string>; expiredQuestions: Set<number>; rating?: object; hostProgression?: ReturnType<typeof progressionResult>; guestProgression?: ReturnType<typeof progressionResult> };
 type Player = { id: string; token: string; profileId?: string; displayName?: string; accountId?: string; rating?: number; searchId?: string; socket?: Socket; roomCode?: string; deadline?: number; graceTimer?: NodeJS.Timeout };
 type Room = { code: string; difficulty: Difficulty; ranked: boolean; host: Player; guest?: Player; hostReady: boolean; guestReady: boolean; match?: Match };
 type SearchEntry = { player: Player; searchId: string; difficulty: Difficulty; joinedAt: number };
@@ -340,16 +340,22 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     const room = code ? this.rooms.get(code) : undefined;
     const match = room?.match;
     if (!room || !match || !player) return { ok: false, result: 'invalid', error: 'no active match', ...base };
-    if (body?.matchId !== match.matchId || body?.questionId !== match.question.questionId) {
+    if (body?.matchId !== match.matchId) {
+      return { ok: false, result: 'invalid', error: 'stale question', ...base };
+    }
+    if (body?.questionId !== match.question.questionId) {
+      if (typeof body?.questionId === 'number' && match.expiredQuestions.has(body.questionId)) {
+        return { ok: false, result: 'question_expired', code: 'QUESTION_EXPIRED', error: 'Question expired', ...base };
+      }
       return { ok: false, result: 'invalid', error: 'stale question', ...base };
     }
     const requestKey = `${player.id}:${requestId}`;
     const previous = requestId ? match.requests.get(requestKey) : undefined;
-    if (previous) return previous;
     const role = room.host === player ? 'host' : room.guest === player ? 'guest' : undefined;
     if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId) || !role) {
       return { ok: false, result: 'invalid', error: 'invalid request', ...base };
     }
+    if (previous && (previous as { result?: string }).result === 'correct') return previous;
     if (match.phase === 'PAUSED' || match.phase === 'FINISHED') {
       const response = { ok: false, result: 'invalid', error: match.phase === 'PAUSED' ? 'match paused' : 'match finished', ...base };
       this.rememberRequest(match, requestKey, response);
@@ -360,6 +366,14 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
       this.rememberRequest(match, requestKey, response);
       return response;
     }
+    if (match.phase === 'ANSWERING' && match.closesAt !== undefined && Date.now() >= match.closesAt) {
+      this.expireQuestion(room, match, match.question.questionId, match.revision);
+      return { ok: false, result: 'question_expired', code: 'QUESTION_EXPIRED', error: 'Question expired', ...base };
+    }
+    if (match.phase === 'ANSWERING' && match.closesAt === undefined) {
+      return { ok: false, result: 'invalid', error: 'question timing unavailable', ...base };
+    }
+    if (previous) return previous;
     if (match.phase !== 'ANSWERING') {
       const result = match.phase === 'RESOLVING' ? 'already_resolved' : 'invalid';
       const response = { ok: false, result, error: 'stale question', ...base };
@@ -377,6 +391,9 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     }
     const accepted = { ok: true, result: 'correct', ...base };
     this.rememberRequest(match, requestKey, accepted);
+    clearTimeout(match.expiryTimer);
+    match.expiryTimer = undefined;
+    match.closesAt = undefined;
     match.phase = 'RESOLVING';
     match.attacker = role;
     match.revision++;
@@ -455,7 +472,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   private startMatch(room: Room) {
     const matchId = randomUUID();
     const question = this.makeQuestion(matchId, 1, room.difficulty);
-    room.match = { matchId, difficulty: room.difficulty, ranked: room.ranked, hostName: room.host.displayName!, guestName: room.guest!.displayName!, question, phase: 'SCHEDULED', requiresReceipts: false, hostHp: 100, guestHp: 100, revision: 0, requests: new Map(), received: new Set(), startedAt: new Date() };
+    room.match = { matchId, difficulty: room.difficulty, ranked: room.ranked, hostName: room.host.displayName!, guestName: room.guest!.displayName!, question, phase: 'SCHEDULED', requiresReceipts: false, hostHp: 100, guestHp: 100, revision: 0, requests: new Map(), received: new Set(), expiredQuestions: new Set(), startedAt: new Date() };
     this.emitState(room.code);
     this.scheduleQuestion(room, 3_000, 'FIRST', 'match:start', question);
   }
@@ -464,10 +481,13 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     const match = room.match;
     if (!match) return;
     clearTimeout(match.timer);
+    clearTimeout(match.expiryTimer);
+    match.expiryTimer = undefined;
     const previous = match.question;
     match.question = prepared ?? this.makeQuestion(match.matchId, previous.questionId + 1, match.difficulty, previous);
     match.phase = 'SCHEDULED';
     match.opensAt = Date.now() + delayMs;
+    match.closesAt = match.opensAt + this.questionDuration(match.difficulty);
     match.scheduleReason = reason;
     match.requiresReceipts = reason === 'RESUME';
     match.attacker = undefined;
@@ -477,7 +497,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     const scheduledRevision = match.revision;
     const payload = { ...match.question, difficulty: match.difficulty, ranked: match.ranked,
       matchType: match.ranked ? 'RANKED' : 'UNRANKED', hostName: match.hostName, guestName: match.guestName,
-      playerHp: match.hostHp, opponentHp: match.guestHp, phase: match.phase, opensAt: match.opensAt,
+      playerHp: match.hostHp, opponentHp: match.guestHp, phase: match.phase, opensAt: match.opensAt, closesAt: match.closesAt,
       scheduleReason: reason, revision: match.revision };
     this.broadcastMatch(room, event, event === 'match:resumed' ? this.snapshot(match, room) : payload);
     const roomCode = room.code;
@@ -502,17 +522,56 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     match.phase = 'ANSWERING';
     match.requiresReceipts = false;
     match.revision++;
+    this.armQuestionExpiry(room, match.revision);
     this.broadcastMatch(room, 'match:snapshot', this.snapshot(match, room));
+  }
+
+  private armQuestionExpiry(room: Room, answeringRevision: number) {
+    const match = room.match;
+    if (!match || match.phase !== 'ANSWERING' || match.closesAt === undefined) return;
+    clearTimeout(match.expiryTimer);
+    const roomCode = room.code;
+    const matchId = match.matchId;
+    const questionId = match.question.questionId;
+    match.expiryTimer = setTimeout(() => {
+      this.expireQuestion(room, match, questionId, answeringRevision, roomCode, matchId);
+    }, Math.max(0, match.closesAt - Date.now()) + 1);
+  }
+
+  private expireQuestion(room: Room, match: Match, questionId: number, revision: number, roomCode = room.code, matchId = match.matchId) {
+    const current = this.rooms.get(roomCode);
+    if (current !== room || current.match !== match || match.matchId !== matchId || match.question.questionId !== questionId ||
+        match.revision !== revision || match.phase !== 'ANSWERING' || match.closesAt === undefined || Date.now() < match.closesAt) return;
+    clearTimeout(match.expiryTimer);
+    match.expiryTimer = undefined;
+    match.expiredQuestions.add(questionId);
+    while (match.expiredQuestions.size > 32) match.expiredQuestions.delete(match.expiredQuestions.values().next().value as number);
+    match.requests.clear();
+    match.received.clear();
+    match.phase = 'RESOLVING';
+    match.attacker = undefined;
+    match.closesAt = undefined;
+    this.scheduleQuestion(room, 1_500, 'NEXT', 'match:question');
+  }
+
+  private questionDuration(difficulty: Difficulty) {
+    if (difficulty === 'EASY') return 10_000;
+    if (difficulty === 'EXPERT') return 20_000;
+    return 15_000;
   }
 
   private async finishMatch(room: Room, attacker: Role, message?: string) {
     const match = room.match;
     if (!match || match.phase === 'FINISHED') return;
     clearTimeout(match.timer);
+    clearTimeout(match.expiryTimer);
+    match.timer = undefined;
+    match.expiryTimer = undefined;
     match.requests.clear();
     match.received.clear();
     match.phase = 'FINISHED';
     match.opensAt = undefined;
+    match.closesAt = undefined;
     match.scheduleReason = undefined;
     match.requiresReceipts = false;
     match.winner = attacker;
@@ -550,6 +609,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
       playerHp: match.hostHp, opponentHp: match.guestHp, attacker: match.attacker, winner: match.winner, revision: match.revision,
       rating: match.rating, progression: role === 'host' ? match.hostProgression : role === 'guest' ? match.guestProgression : undefined,
       message: match.message, ranked: match.ranked, matchType: match.ranked ? 'RANKED' : 'UNRANKED', opensAt: match.opensAt ?? null,
+      closesAt: match.closesAt ?? null,
       scheduleReason: match.scheduleReason, deadline: deadlines.length ? Math.min(...deadlines) : undefined, serverNow: Date.now() };
   }
 
@@ -575,7 +635,9 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
       return;
     }
     clearTimeout(match.timer);
+    clearTimeout(match.expiryTimer);
     match.timer = undefined;
+    match.expiryTimer = undefined;
     match.requests.clear();
     match.received.clear();
     this.startGrace(player);
@@ -587,6 +649,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     }
     match.phase = 'PAUSED';
     match.opensAt = undefined;
+    match.closesAt = undefined;
     match.scheduleReason = undefined;
     match.requiresReceipts = false;
     match.attacker = undefined;
@@ -611,6 +674,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     const room = player.roomCode ? this.rooms.get(player.roomCode) : undefined;
     if (room && !room.host.socket && !room.guest?.socket) {
       clearTimeout(room.match?.timer);
+      clearTimeout(room.match?.expiryTimer);
       this.rooms.delete(room.code);
       if (room.guest) this.removePlayer(room.guest);
       this.removePlayer(room.host);
@@ -652,7 +716,10 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
 
   onApplicationShutdown() {
     if (this.matchmakingTimer) clearInterval(this.matchmakingTimer);
-    for (const room of this.rooms.values()) clearTimeout(room.match?.timer);
+    for (const room of this.rooms.values()) {
+      clearTimeout(room.match?.timer);
+      clearTimeout(room.match?.expiryTimer);
+    }
     for (const player of this.players.values()) clearTimeout(player.graceTimer);
     this.rooms.clear();
     this.players.clear();

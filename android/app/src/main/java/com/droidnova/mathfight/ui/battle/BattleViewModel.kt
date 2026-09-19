@@ -81,6 +81,13 @@ data class MatchSearchState(val active: Boolean = false, val searchId: String = 
 data class LeaderboardRow(val position: Int, val displayName: String, val rating: Int, val tier: String, val wins: Int, val losses: Int, val current: Boolean)
 data class LeaderboardState(val loading: Boolean = false, val connected: Boolean = false, val error: String = "", val rows: List<LeaderboardRow> = emptyList(), val currentPosition: Int = 0)
 data class RankedResult(val ranked: Boolean = false, val available: Boolean = false, val before: Int = 1000, val delta: Int = 0, val after: Int = 1000, val tier: String = "Silver")
+data class OnlineQuestionTimerState(
+    val visible: Boolean = false,
+    val seconds: Int = 0,
+    val expired: Boolean = false
+) {
+    val warning: Boolean get() = visible && seconds <= 3
+}
 private data class PendingAnswer(val requestId: String, val matchId: String, val questionId: Long)
 private data class ClockSample(val roundTripMs: Long, val serverEpochAtMidpointMs: Long, val localMidpointMs: Long)
 private data class ServerClockMapping(val serverEpochAtMidpointMs: Long, val localMidpointMs: Long) {
@@ -91,10 +98,17 @@ private data class ScheduledOnlineQuestion(
     val questionId: Long,
     val revision: Long,
     val opensAt: Long,
+    val closesAt: Long,
     val reason: String,
     val question: Question,
     val hostHp: Int,
     val guestHp: Int
+)
+private data class ActiveQuestionWindow(
+    val matchId: String,
+    val questionId: Long,
+    val opensAt: Long,
+    val closesAt: Long
 )
 private class ProfileSyncFailure(message: String) : Exception(message)
 
@@ -177,12 +191,16 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     val onlineSubmissionStatus = mutableOnlineSubmissionStatus.asStateFlow()
     private val mutableOnlineQuestionPrompt = MutableStateFlow("")
     val onlineQuestionPrompt = mutableOnlineQuestionPrompt.asStateFlow()
+    private val mutableOnlineQuestionTimer = MutableStateFlow(OnlineQuestionTimerState())
+    val onlineQuestionTimer = mutableOnlineQuestionTimer.asStateFlow()
     private val mutableOnlinePaused = MutableStateFlow(false)
     val onlinePaused = mutableOnlinePaused.asStateFlow()
     private var pauseCountdownJob: Job? = null
     private var pauseServerDeadline: Long? = null
     private var questionCountdownJob: Job? = null
+    private var answerCountdownJob: Job? = null
     private var scheduledOnlineQuestion: ScheduledOnlineQuestion? = null
+    private var activeQuestionWindow: ActiveQuestionWindow? = null
     private var serverClock: ServerClockMapping? = null
     private var clockSyncJob: Job? = null
     private var lastAttackQuestion = 0L
@@ -560,7 +578,8 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
 
     fun submitOnlineAnswer() {
         val match = onlineMatch.value ?: return
-        if (mutableState.value.phase != BattlePhase.ANSWERING || mutableOnlineAnswerLocked.value || mutableState.value.input.isEmpty()) return
+        if (mutableState.value.phase != BattlePhase.ANSWERING || mutableOnlineAnswerLocked.value ||
+            mutableState.value.input.isEmpty() || !isCurrentQuestionOpen()) return
         val current = socket
         if (!sessionReady || !connectionForeground || current?.connected() != true) {
             mutableOnlineSubmissionStatus.value = "Reconnecting\u2026"
@@ -589,13 +608,20 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                     // Remain locked until the authoritative attack or question update arrives.
                     mutableOnlineAnswerLocked.value = true
                 } else if (response.optString("result") == "incorrect") {
-                    mutableOnlineAnswerLocked.value = false
                     mutableState.value = mutableState.value.copy(input = "", wrongAnswer = true)
+                    if (isCurrentQuestionOpen()) {
+                        mutableOnlineAnswerLocked.value = false
+                    } else {
+                        markQuestionExpiredLocally()
+                    }
                 } else if (response.optString("result") == "not_open" || response.optString("code") == "NOT_OPEN") {
                     // Keep the authoritative question visible and wait for the server's opening transition.
                     mutableOnlineAnswerLocked.value = true
                     mutableOnlineSubmissionStatus.value = "Question not open yet"
                     mutableState.value = mutableState.value.copy(input = answer, wrongAnswer = false)
+                    requestOnlineSnapshot()
+                } else if (response.optString("result") == "question_expired" || response.optString("code") == "QUESTION_EXPIRED") {
+                    markQuestionExpiredLocally()
                     requestOnlineSnapshot()
                 } else if (response.optString("result") == "already_resolved" || response.optString("result") == "invalid") {
                     mutableOnlineAnswerLocked.value = true
@@ -611,7 +637,8 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                 delay(3_000L)
                 if (pendingAnswer == pending) {
                     pendingAnswer = null
-                    mutableOnlineAnswerLocked.value = false
+                    if (isCurrentQuestionOpen()) mutableOnlineAnswerLocked.value = false
+                    else markQuestionExpiredLocally()
                 }
             }
         }
@@ -655,11 +682,18 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                     response.optJSONObject("snapshot")?.let { snapshot ->
                         val clock = serverClock
                         val opensAt = snapshot.optLong("opensAt")
+                        val closesAt = snapshot.optLong("closesAt")
                         if (snapshot.optLong("revision") == onlineRevision && snapshot.optString("phase").uppercase() == "ANSWERING" &&
                             clock != null && opensAt > 0L && SystemClock.elapsedRealtime() >= clock.localElapsedFor(opensAt) &&
+                            closesAt > opensAt && SystemClock.elapsedRealtime() < clock.localElapsedFor(closesAt) &&
                             mutableState.value.question != null) {
                             clearPendingAnswer()
                             mutableOnlineAnswerLocked.value = false
+                            startAnswerCountdown(matchId, snapshot.optLong("questionId"), opensAt, closesAt)
+                        } else if (snapshot.optLong("revision") == onlineRevision && snapshot.optString("phase").uppercase() == "ANSWERING" &&
+                            clock != null && closesAt > 0L && SystemClock.elapsedRealtime() >= clock.localElapsedFor(closesAt)) {
+                            clearPendingAnswer()
+                            markQuestionExpiredLocally()
                         }
                         applyOnlineSnapshot(snapshot)
                     }
@@ -678,6 +712,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         onlineResultJob?.cancel()
         questionCountdownJob?.cancel()
         questionCountdownJob = null
+        clearAnswerCountdown()
         scheduledOnlineQuestion = null
         mutableOnlineQuestionPrompt.value = ""
         mutableOnlineMatch.value = null
@@ -710,6 +745,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         onlineResultJob?.cancel()
         questionCountdownJob?.cancel()
         questionCountdownJob = null
+        clearAnswerCountdown()
         scheduledOnlineQuestion = null
         mutableOnlineQuestionPrompt.value = ""
         pauseCountdownJob?.cancel()
@@ -841,15 +877,17 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         guestHp: Int,
         revision: Long,
         opensAt: Long,
+        closesAt: Long,
         reason: String
     ) {
         clearPendingAnswer()
+        clearAnswerCountdown()
         onlineResolutionJob?.cancel()
         onlineResultJob?.cancel()
         pauseCountdownJob?.cancel()
         pauseServerDeadline = null
         val scheduled = ScheduledOnlineQuestion(
-            info.matchId, info.questionId, revision, opensAt, reason, question, hostHp, guestHp
+            info.matchId, info.questionId, revision, opensAt, closesAt, reason, question, hostHp, guestHp
         )
         scheduledOnlineQuestion = scheduled
         mutableOnlineAnswerLocked.value = true
@@ -895,11 +933,11 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         scheduledOnlineQuestion = null
         mutableOnlineQuestionPrompt.value = ""
         mutableOnlinePaused.value = false
-        mutableOnlineAnswerLocked.value = false
         mutableOnlineSubmissionStatus.value = ""
         mutableState.value = onlineBattleState(
             scheduled.question, info, scheduled.hostHp, scheduled.guestHp, BattlePhase.ANSWERING
         )
+        startAnswerCountdown(info.matchId, info.questionId, scheduled.opensAt, scheduled.closesAt)
     }
 
     private fun clearScheduledQuestion() {
@@ -907,6 +945,65 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         questionCountdownJob = null
         scheduledOnlineQuestion = null
         mutableOnlineQuestionPrompt.value = ""
+        clearAnswerCountdown()
+    }
+
+    private fun startAnswerCountdown(matchId: String, questionId: Long, opensAt: Long, closesAt: Long) {
+        clearAnswerCountdown()
+        val clock = serverClock
+        if (clock == null || opensAt <= 0L || closesAt <= opensAt) {
+            mutableOnlineAnswerLocked.value = true
+            mutableOnlineQuestionPrompt.value = "Synchronizing\u2026"
+            return
+        }
+        val window = ActiveQuestionWindow(matchId, questionId, opensAt, closesAt)
+        activeQuestionWindow = window
+        val localOpensAt = clock.localElapsedFor(opensAt)
+        val localClosesAt = clock.localElapsedFor(closesAt)
+        answerCountdownJob = viewModelScope.launch {
+            while (activeQuestionWindow === window && mutableOnlineMatch.value?.matchId == matchId &&
+                mutableOnlineMatch.value?.questionId == questionId) {
+                val now = SystemClock.elapsedRealtime()
+                if (now < localOpensAt) {
+                    mutableOnlineAnswerLocked.value = true
+                    delay(minOf(localOpensAt - now, 100L))
+                    continue
+                }
+                val remaining = localClosesAt - now
+                if (remaining <= 0L) {
+                    markQuestionExpiredLocally()
+                    return@launch
+                }
+                val seconds = ((remaining + 999L) / 1_000L).toInt()
+                mutableOnlineQuestionTimer.value = OnlineQuestionTimerState(visible = true, seconds = seconds)
+                mutableOnlineAnswerLocked.value = false
+                delay((remaining - (seconds - 1L) * 1_000L).coerceAtLeast(1L))
+            }
+        }
+    }
+
+    private fun clearAnswerCountdown() {
+        answerCountdownJob?.cancel()
+        answerCountdownJob = null
+        activeQuestionWindow = null
+        mutableOnlineQuestionTimer.value = OnlineQuestionTimerState()
+    }
+
+    private fun markQuestionExpiredLocally() {
+        answerCountdownJob?.cancel()
+        answerCountdownJob = null
+        clearPendingAnswer()
+        mutableOnlineAnswerLocked.value = true
+        mutableOnlineQuestionTimer.value = OnlineQuestionTimerState(visible = true, seconds = 0, expired = true)
+    }
+
+    private fun isCurrentQuestionOpen(): Boolean {
+        val info = mutableOnlineMatch.value ?: return false
+        val window = activeQuestionWindow ?: return false
+        val clock = serverClock ?: return false
+        if (window.matchId != info.matchId || window.questionId != info.questionId) return false
+        val now = SystemClock.elapsedRealtime()
+        return now >= clock.localElapsedFor(window.opensAt) && now < clock.localElapsedFor(window.closesAt)
     }
 
     private fun refreshPauseCountdown() {
@@ -946,7 +1043,8 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         onlineRevision = value.optLong("revision", 1L)
         onlineResult = null
         stageOnlineQuestion(info, onlineQuestion(value), value.optInt("playerHp", 100), value.optInt("opponentHp", 100),
-            onlineRevision, value.optLong("opensAt"), value.optString("scheduleReason", "FIRST").uppercase())
+            onlineRevision, value.optLong("opensAt"), value.optLong("closesAt"),
+            value.optString("scheduleReason", "FIRST").uppercase())
     }
 
     private fun handleMatchQuestion(value: JSONObject) {
@@ -958,7 +1056,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         val info = old.copy(questionId = value.optLong("questionId"), difficulty = parseDifficulty(value.optString("difficulty")).takeIf { value.has("difficulty") } ?: old.difficulty)
         mutableOnlineMatch.value = info
         stageOnlineQuestion(info, onlineQuestion(value), value.optInt("playerHp"), value.optInt("opponentHp"), revision,
-            value.optLong("opensAt"), value.optString("scheduleReason", "NEXT").uppercase())
+            value.optLong("opensAt"), value.optLong("closesAt"), value.optString("scheduleReason", "NEXT").uppercase())
     }
 
     private fun handleMatchAttack(value: JSONObject) {
@@ -1056,22 +1154,24 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         when (value.optString("phase").uppercase()) {
             "SCHEDULED" -> {
                 val reason = value.optString("scheduleReason", if (questionId == 1L) "FIRST" else "NEXT").uppercase()
-                stageOnlineQuestion(updatedInfo, question, hostHp, guestHp, revision, value.optLong("opensAt"), reason)
+                stageOnlineQuestion(updatedInfo, question, hostHp, guestHp, revision, value.optLong("opensAt"),
+                    value.optLong("closesAt"), reason)
                 if (reason == "RESUME") acknowledgeFreshQuestion(value)
             }
             "ANSWERING" -> {
                 pauseServerDeadline = null
                 mutableOnlinePaused.value = false
                 val opensAt = value.optLong("opensAt")
+                val closesAt = value.optLong("closesAt")
                 val clock = serverClock
                 if (clock == null || opensAt <= 0L || SystemClock.elapsedRealtime() < clock.localElapsedFor(opensAt)) {
                     val reason = value.optString("scheduleReason", if (questionId == 1L) "FIRST" else "NEXT").uppercase()
-                    stageOnlineQuestion(updatedInfo, question, hostHp, guestHp, revision, opensAt, reason)
+                    stageOnlineQuestion(updatedInfo, question, hostHp, guestHp, revision, opensAt, closesAt, reason)
                 } else {
                     clearScheduledQuestion()
-                    mutableOnlineAnswerLocked.value = false
                     mutableOnlineSubmissionStatus.value = ""
                     mutableState.value = onlineBattleState(question, updatedInfo, hostHp, guestHp, BattlePhase.ANSWERING)
+                    startAnswerCountdown(updatedInfo.matchId, updatedInfo.questionId, opensAt, closesAt)
                 }
             }
             "RESOLVING" -> {
@@ -1523,15 +1623,15 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     fun startBattle() = edit { if (it.phase == BattlePhase.HOME) newBattle(it, difficulty.value) else it }
     fun restartBattle() = edit { if (it.phase == BattlePhase.RESULT) newBattle(it, difficulty.value) else it }
     fun digit(value: Int) {
-        if (onlineMatch.value != null && (onlineAnswerLocked.value || !resumed.value)) return
+        if (onlineMatch.value != null && (onlineAnswerLocked.value || !resumed.value || !isCurrentQuestionOpen())) return
         if (onlineMatch.value != null) mutableState.value = enterDigit(mutableState.value, value) else edit { enterDigit(it, value) }
     }
     fun backspace() {
-        if (onlineMatch.value != null && (onlineAnswerLocked.value || !resumed.value)) return
+        if (onlineMatch.value != null && (onlineAnswerLocked.value || !resumed.value || !isCurrentQuestionOpen())) return
         if (onlineMatch.value != null) mutableState.value = eraseDigit(mutableState.value) else edit(::eraseDigit)
     }
     fun clear() {
-        if (onlineMatch.value != null && (onlineAnswerLocked.value || !resumed.value)) return
+        if (onlineMatch.value != null && (onlineAnswerLocked.value || !resumed.value || !isCurrentQuestionOpen())) return
         if (onlineMatch.value != null) mutableState.value = clearInput(mutableState.value) else edit(::clearInput)
     }
     fun submit() {

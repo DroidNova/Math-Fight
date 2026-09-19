@@ -56,6 +56,7 @@ class MainActivity : ComponentActivity() {
             val onlineAnswerLocked by battleViewModel.onlineAnswerLocked.collectAsStateWithLifecycle()
             val onlineSubmissionStatus by battleViewModel.onlineSubmissionStatus.collectAsStateWithLifecycle()
             val onlineQuestionPrompt by battleViewModel.onlineQuestionPrompt.collectAsStateWithLifecycle()
+            val onlineQuestionTimer by battleViewModel.onlineQuestionTimer.collectAsStateWithLifecycle()
             val onlinePaused by battleViewModel.onlinePaused.collectAsStateWithLifecycle()
             val leaderboard by battleViewModel.leaderboard.collectAsStateWithLifecycle()
             val leaderboardOpen by battleViewModel.leaderboardOpen.collectAsStateWithLifecycle()
@@ -130,6 +131,7 @@ class MainActivity : ComponentActivity() {
                     onlineAnswerLocked = onlineAnswerLocked,
                     onlineSubmissionStatus = onlineSubmissionStatus,
                     onlineQuestionPrompt = onlineQuestionPrompt,
+                    onlineQuestionTimer = onlineQuestionTimer,
                     onRoomCode = battleViewModel::setRoomCodeInput,
                     onCreateRoom = battleViewModel::createRoom,
                     onJoinRoom = battleViewModel::joinRoom,

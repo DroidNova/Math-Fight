@@ -99,6 +99,7 @@ fun MathFightApp(
     onlineAnswerLocked: Boolean,
     onlineSubmissionStatus: String,
     onlineQuestionPrompt: String,
+    onlineQuestionTimer: OnlineQuestionTimerState,
     onRoomCode: (String) -> Unit,
     onCreateRoom: () -> Unit,
     onJoinRoom: () -> Unit,
@@ -135,6 +136,7 @@ fun MathFightApp(
             ,online = onlineMatch != null, onlineAnswerLocked = onlineAnswerLocked,
             onlineSubmissionStatus = onlineSubmissionStatus,
             onlineQuestionPrompt = onlineQuestionPrompt,
+            onlineQuestionTimer = onlineQuestionTimer,
             difficulty = onlineMatch?.difficulty ?: difficulty,
             canRetry = onlineMatch != null && connectionStatus == BattleViewModel.ConnectionStatus.DISCONNECTED,
             onRetry = onConnect,
@@ -236,6 +238,7 @@ private fun BattleScreen(
     onlineAnswerLocked: Boolean,
     onlineSubmissionStatus: String,
     onlineQuestionPrompt: String,
+    onlineQuestionTimer: OnlineQuestionTimerState,
     difficulty: Difficulty,
     canRetry: Boolean,
     onRetry: () -> Unit,
@@ -264,6 +267,19 @@ private fun BattleScreen(
                 fontWeight = FontWeight.Bold,
                 textAlign = TextAlign.Center
             )
+            if (online) {
+                Text(
+                    text = when {
+                        onlineQuestionTimer.expired -> "Time\u2019s up \u00b7 0"
+                        onlineQuestionTimer.visible -> onlineQuestionTimer.seconds.toString()
+                        else -> " "
+                    },
+                    color = if (onlineQuestionTimer.warning) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                    style = MaterialTheme.typography.labelLarge,
+                    modifier = Modifier.heightIn(min = 20.dp)
+                )
+            }
             Text(
                 text = state.input.ifEmpty { " " },
                 modifier = Modifier.fillMaxWidth().padding(top = 2.dp),
