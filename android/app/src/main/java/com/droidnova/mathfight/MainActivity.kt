@@ -51,6 +51,7 @@ class MainActivity : ComponentActivity() {
             val room by battleViewModel.room.collectAsStateWithLifecycle()
             val roomError by battleViewModel.roomError.collectAsStateWithLifecycle()
             val search by battleViewModel.search.collectAsStateWithLifecycle()
+            val difficulty by battleViewModel.difficulty.collectAsStateWithLifecycle()
             val onlineMatch by battleViewModel.onlineMatch.collectAsStateWithLifecycle()
             val onlineAnswerLocked by battleViewModel.onlineAnswerLocked.collectAsStateWithLifecycle()
             val onlineSubmissionStatus by battleViewModel.onlineSubmissionStatus.collectAsStateWithLifecycle()
@@ -95,6 +96,8 @@ class MainActivity : ComponentActivity() {
                     search = search,
                     onFindMatch = battleViewModel::findMatch,
                     onCancelMatch = battleViewModel::cancelMatch,
+                    difficulty = difficulty,
+                    onDifficulty = battleViewModel::setDifficulty,
                     state = state,
                     isResumed = isResumed,
                     impactToken = impactToken,

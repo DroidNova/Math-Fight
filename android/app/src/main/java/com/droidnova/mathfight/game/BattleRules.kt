@@ -9,8 +9,10 @@ private const val BOT_MAX_DELAY_EXCLUSIVE_MS = 3_501L
 
 enum class Fighter { PLAYER, BOT }
 
+enum class Difficulty { EASY, STANDARD, EXPERT }
+
 enum class Operation(val symbol: String) {
-    ADD("+"), SUBTRACT("−"), MULTIPLY("×")
+    ADD("+"), SUBTRACT("−"), MULTIPLY("×"), DIVIDE("÷")
 }
 
 data class Question(val left: Int, val operation: Operation, val right: Int) {
@@ -19,23 +21,38 @@ data class Question(val left: Int, val operation: Operation, val right: Int) {
             Operation.ADD -> left + right
             Operation.SUBTRACT -> left - right
             Operation.MULTIPLY -> left * right
+            Operation.DIVIDE -> left / right
         }
 
     val display: String
         get() = "$left ${operation.symbol} $right = ?"
 }
 
-fun generateQuestion(previous: Question? = null, random: Random = Random.Default): Question {
+fun generateQuestion(previous: Question? = null, difficulty: Difficulty = Difficulty.STANDARD, random: Random = Random.Default): Question {
     repeat(8) {
-        val operation = Operation.entries.random(random)
-        val candidate = when (operation) {
-            Operation.ADD -> Question(random.nextInt(0, 21), operation, random.nextInt(0, 21))
-            Operation.SUBTRACT -> {
-                val first = random.nextInt(0, 21)
-                val second = random.nextInt(0, 21)
-                Question(maxOf(first, second), operation, minOf(first, second))
+        val allowed = if (difficulty == Difficulty.EXPERT) Operation.entries else Operation.entries.filter { it != Operation.DIVIDE }
+        val selected = allowed.random(random)
+        val candidate = when (selected) {
+            Operation.ADD -> {
+                val max = if (difficulty == Difficulty.EASY) 10 else if (difficulty == Difficulty.EXPERT) 200 else 50
+                Question(random.nextInt(0, max + 1), selected, random.nextInt(0, max + 1))
             }
-            Operation.MULTIPLY -> Question(random.nextInt(1, 11), operation, random.nextInt(1, 11))
+            Operation.SUBTRACT -> {
+                val max = if (difficulty == Difficulty.EASY) 10 else if (difficulty == Difficulty.EXPERT) 200 else 50
+                val first = random.nextInt(0, max + 1)
+                val second = random.nextInt(0, max + 1)
+                Question(maxOf(first, second), selected, minOf(first, second))
+            }
+            Operation.MULTIPLY -> {
+                val max = if (difficulty == Difficulty.EASY) 5 else if (difficulty == Difficulty.EXPERT) 20 else 12
+                val min = if (difficulty == Difficulty.EXPERT) 2 else 1
+                Question(random.nextInt(min, max + 1), selected, random.nextInt(min, max + 1))
+            }
+            Operation.DIVIDE -> {
+                val divisor = random.nextInt(2, 21)
+                val quotient = random.nextInt(2, 21)
+                Question(divisor * quotient, selected, divisor)
+            }
         }
         if (candidate != previous) return candidate
     }
@@ -65,9 +82,9 @@ data class BattleState(
         get() = PhaseKey(battleId, questionId, phase)
 }
 
-fun newBattle(previous: BattleState, random: Random = Random.Default) = BattleState(
+fun newBattle(previous: BattleState, difficulty: Difficulty = Difficulty.STANDARD, random: Random = Random.Default) = BattleState(
     phase = BattlePhase.ANSWERING,
-    question = generateQuestion(previous.question, random),
+    question = generateQuestion(previous.question, difficulty, random),
     battleId = previous.battleId + 1,
     questionId = 1,
     botRemainingMs = random.nextLong(BOT_MIN_DELAY_MS, BOT_MAX_DELAY_EXCLUSIVE_MS)
@@ -115,6 +132,7 @@ fun submitAnswer(state: BattleState): BattleState {
 fun advancePhase(
     state: BattleState,
     expected: PhaseKey,
+    difficulty: Difficulty = Difficulty.STANDARD,
     random: Random = Random.Default
 ): BattleState {
     if (state.key != expected) return state
@@ -136,7 +154,7 @@ fun advancePhase(
             state.playerHp == 0 -> state.copy(phase = BattlePhase.KO, winner = Fighter.BOT)
             else -> state.copy(
                 phase = BattlePhase.ANSWERING,
-                question = generateQuestion(state.question, random),
+                question = generateQuestion(state.question, difficulty, random),
                 questionId = state.questionId + 1,
                 input = "",
                 wrongAnswer = false,

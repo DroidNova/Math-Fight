@@ -49,3 +49,7 @@ Manual checks: background/return within 15 seconds; old answers and delayed repl
 First launch asks for a player name; Home → Profile changes it later. A local UUID and name are saved in Preferences DataStore (`androidx.datastore:datastore-preferences:1.2.1`). Names use 3–16 Unicode letter/number characters, ordinary spaces, or underscore; outside spaces are trimmed and repeated spaces collapsed. Both Android and the server validate them. Duplicate names are allowed. The UUID is metadata, never authentication: live reconnection still requires the private resume token.
 
 The existing socket synchronizes the saved profile after connection/resume. Lobby names update on a rename; battle/result names are fixed for that match. Verify fresh setup, invalid names, persistence after app restart, renaming in a connected lobby, duplicate names on two phones, correct names after reconnect/rematch, and the saved name versus Bot offline. Install the updated APK on both phones and restart the server.
+
+## Milestone 11 difficulty modes
+
+Easy, Standard, and Expert are shared by offline questions, private rooms, and random matchmaking. Standard is the default and the last selection is saved with the profile preferences. Expert adds exact whole-number division; the server remains authoritative for online answers. Private-room hosts choose the mode and guests inherit it; matchmaking queues are separated by mode. Install the updated APK on both phones and restart the server when changing this protocol.

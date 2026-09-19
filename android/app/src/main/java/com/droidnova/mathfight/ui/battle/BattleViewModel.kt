@@ -22,6 +22,7 @@ import com.droidnova.mathfight.game.Fighter
 import com.droidnova.mathfight.game.PhaseKey
 import com.droidnova.mathfight.game.Question
 import com.droidnova.mathfight.game.Operation
+import com.droidnova.mathfight.game.Difficulty
 import com.droidnova.mathfight.game.advancePhase
 import com.droidnova.mathfight.game.claimQuestion
 import com.droidnova.mathfight.game.clearInput
@@ -58,14 +59,15 @@ data class RoomInfo(
     val guestReady: Boolean = false,
     val matchActive: Boolean = false,
     val hostName: String = "",
-    val guestName: String = ""
+    val guestName: String = "",
+    val difficulty: Difficulty = Difficulty.STANDARD
 )
 data class OnlineMatchInfo(val matchId: String, val questionId: Long, val role: String,
-                           val hostName: String, val guestName: String) {
+                           val hostName: String, val guestName: String, val difficulty: Difficulty) {
     val localName: String get() = if (role.equals("host", true)) hostName else guestName
     val opponentName: String get() = if (role.equals("host", true)) guestName else hostName
 }
-data class MatchSearchState(val active: Boolean = false, val searchId: String = "", val status: String = "idle", val opponentName: String = "", val error: String = "")
+data class MatchSearchState(val active: Boolean = false, val searchId: String = "", val status: String = "idle", val opponentName: String = "", val difficulty: Difficulty = Difficulty.STANDARD, val error: String = "")
 private data class PendingAnswer(val requestId: String, val matchId: String, val questionId: Long)
 private class ProfileSyncFailure(message: String) : Exception(message)
 
@@ -75,6 +77,8 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     val profile = mutableProfile.asStateFlow()
     private var profileLoadJob: Job? = null
     private var profileSaveJob: Job? = null
+    private val mutableDifficulty = MutableStateFlow(Difficulty.STANDARD)
+    val difficulty = mutableDifficulty.asStateFlow()
     private val mutableState = MutableStateFlow(BattleState())
     val state = mutableState.asStateFlow()
 
@@ -146,6 +150,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         profileLoadJob = viewModelScope.launch {
             try {
                 val loaded = profileStore.load()
+                mutableDifficulty.value = profileStore.loadDifficulty()
                 localProfile = loaded
                 mutableProfile.value = ProfileUiState(loading = false, displayName = loaded.displayName, nameInput = loaded.displayName)
             } catch (_: IOException) {
@@ -166,6 +171,17 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
 
     fun setProfileName(value: String) {
         if (!profile.value.saving) mutableProfile.value = profile.value.copy(nameInput = value, error = "")
+    }
+
+    fun setDifficulty(value: Difficulty) {
+        val currentRoom = room.value
+        if (search.value.active || currentRoom?.matchActive == true) return
+        if (currentRoom != null) {
+            if (currentRoom.role.equals("Host", true)) setRoomDifficulty(value)
+            return
+        }
+        mutableDifficulty.value = value
+        viewModelScope.launch { profileStore.saveDifficulty(value) }
     }
 
     fun saveProfile() {
@@ -247,6 +263,19 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         })
     }
 
+    fun setRoomDifficulty(value: Difficulty) {
+        val current = socket ?: return
+        val currentRoom = room.value ?: return
+        if (!currentRoom.role.equals("Host", true) || currentRoom.matchActive || !sessionReady) return
+        current.emit("room:difficulty", JSONObject().put("difficulty", value.name), io.socket.client.Ack { args ->
+            mainHandler.post {
+                if (socket !== current || args.firstOrNull() !is JSONObject) return@post
+                val response = args[0] as JSONObject
+                if (!response.optBoolean("ok")) setRoomError(response.optString("error", "Difficulty change failed"))
+            }
+        })
+    }
+
     fun setServerUrl(value: String) {
         if (value == mutableServerUrl.value) return
         mutableServerUrl.value = value
@@ -284,8 +313,8 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         if (room.value != null || onlineMatch.value != null) return setSearchError("Leave the current room first")
         if (search.value.active) return
         completedSearchId = null
-        mutableSearch.value = MatchSearchState(active = true, status = "waiting")
-        current.emit("matchmaking:join", io.socket.client.Ack { args ->
+        mutableSearch.value = MatchSearchState(active = true, status = "waiting", difficulty = difficulty.value)
+        current.emit("matchmaking:join", JSONObject().put("difficulty", difficulty.value.name), io.socket.client.Ack { args ->
             mainHandler.post {
                 if (socket !== current || args.firstOrNull() !is JSONObject) return@post
                 val response = args[0] as JSONObject
@@ -293,7 +322,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                     mutableSearch.value = MatchSearchState(error = response.optString("error", "Matchmaking failed"))
                 } else {
                     val id = response.optString("searchId")
-                    if (id.isNotBlank()) mutableSearch.value = search.value.copy(active = true, searchId = id, status = "waiting", error = "")
+                    if (id.isNotBlank()) mutableSearch.value = search.value.copy(active = true, searchId = id, status = "waiting", difficulty = parseDifficulty(response.optString("difficulty")), error = "")
                 }
             }
         })
@@ -315,6 +344,8 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         mutableSearch.value = MatchSearchState(error = message)
     }
 
+    private fun parseDifficulty(value: String): Difficulty = runCatching { Difficulty.valueOf(value) }.getOrDefault(Difficulty.STANDARD)
+
     private fun clearSearch() { mutableSearch.value = MatchSearchState() }
 
     private fun handleSearchStatus(value: JSONObject) {
@@ -322,7 +353,8 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         if (id == completedSearchId || room.value != null) return
         if (id.isBlank() || id != search.value.searchId && search.value.searchId.isNotBlank()) return
         when (value.optString("status")) {
-            "waiting" -> mutableSearch.value = search.value.copy(active = true, searchId = id, status = "waiting")
+            "waiting" -> mutableSearch.value = search.value.copy(active = true, searchId = id, status = "waiting",
+                difficulty = parseDifficulty(value.optString("difficulty")))
             "cancelled", "idle" -> clearSearch()
         }
     }
@@ -343,7 +375,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         if (!sessionReady || current?.connected() != true) return setRoomError("Connect to the server first")
         val operation = ++roomOperationGeneration
         roomRequestPending = true
-        current.emit("room:create", io.socket.client.Ack { args ->
+        current.emit("room:create", JSONObject().put("difficulty", difficulty.value.name), io.socket.client.Ack { args ->
             mainHandler.post {
                 if (socket !== current || operation != roomOperationGeneration || args.isEmpty() || args[0] !is JSONObject) return@post
                 handleRoomAck(args[0] as JSONObject, operation)
@@ -549,6 +581,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     }
 
     private fun updateRoom(value: JSONObject) {
+        val roomDifficulty = parseDifficulty(value.optString("difficulty"))
         mutableRoom.value = RoomInfo(
             value.optString("code"),
             value.optString("role").replaceFirstChar { it.uppercase() },
@@ -557,8 +590,10 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
             value.optBoolean("guestReady"),
             value.optBoolean("matchActive"),
             value.optString("hostName"),
-            value.optString("guestName")
+            value.optString("guestName"),
+            roomDifficulty
         )
+        mutableDifficulty.value = roomDifficulty
         mutableRoomError.value = ""
     }
 
@@ -581,6 +616,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         val operation = when (value.optString("operation")) {
             "SUBTRACT" -> Operation.SUBTRACT
             "MULTIPLY" -> Operation.MULTIPLY
+            "DIVIDE" -> Operation.DIVIDE
             else -> Operation.ADD
         }
         return Question(value.optInt("left"), operation, value.optInt("right"))
@@ -601,7 +637,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         cancelBot()
         mutableProfile.value = profile.value.copy(editing = false)
         val info = OnlineMatchInfo(value.optString("matchId"), value.optLong("questionId"), role,
-            value.optString("hostName"), value.optString("guestName"))
+            value.optString("hostName"), value.optString("guestName"), parseDifficulty(value.optString("difficulty")))
         mutableOnlineMatch.value = info
         onlineRevision = value.optLong("revision", 1L)
         mutableOnlineAnswerLocked.value = false
@@ -617,7 +653,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         val revision = value.optLong("revision")
         if (value.optString("matchId") != old.matchId || value.optLong("questionId") <= old.questionId || revision <= onlineRevision) return
         onlineRevision = revision
-        val info = old.copy(questionId = value.optLong("questionId"))
+        val info = old.copy(questionId = value.optLong("questionId"), difficulty = parseDifficulty(value.optString("difficulty")).takeIf { value.has("difficulty") } ?: old.difficulty)
         mutableOnlineMatch.value = info
         mutableOnlineAnswerLocked.value = false
         pendingAnswer = null
@@ -943,8 +979,8 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
             if (onlineMatch.value == null) {
                 roleForSocket()?.let { role ->
                     cancelBot()
-                    mutableOnlineMatch.value = OnlineMatchInfo(snapshot.optString("matchId"), snapshot.optLong("questionId"), role,
-                        snapshot.optString("hostName"), snapshot.optString("guestName"))
+                            mutableOnlineMatch.value = OnlineMatchInfo(snapshot.optString("matchId"), snapshot.optLong("questionId"), role,
+                                snapshot.optString("hostName"), snapshot.optString("guestName"), parseDifficulty(snapshot.optString("difficulty")))
                 }
             }
             applyOnlineSnapshot(snapshot)
@@ -1039,7 +1075,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                     if (key == null || mutableOnlineMatch.value != null) return@collectLatest
                     val duration = key.phase.durationMillis() ?: return@collectLatest
                     delay(duration)
-                    if (resumed.value) updateState(advancePhase(mutableState.value, key))
+                    if (resumed.value) updateState(advancePhase(mutableState.value, key, difficulty.value))
                 }
         }
     }
@@ -1114,8 +1150,8 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         if (resumed.value) updateState(transform(mutableState.value))
     }
 
-    fun startBattle() = edit { if (it.phase == BattlePhase.HOME) newBattle(it) else it }
-    fun restartBattle() = edit { if (it.phase == BattlePhase.RESULT) newBattle(it) else it }
+    fun startBattle() = edit { if (it.phase == BattlePhase.HOME) newBattle(it, difficulty.value) else it }
+    fun restartBattle() = edit { if (it.phase == BattlePhase.RESULT) newBattle(it, difficulty.value) else it }
     fun digit(value: Int) {
         if (onlineMatch.value != null && (onlineAnswerLocked.value || !resumed.value)) return
         if (onlineMatch.value != null) mutableState.value = enterDigit(mutableState.value, value) else edit { enterDigit(it, value) }

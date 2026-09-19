@@ -43,6 +43,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.droidnova.mathfight.game.BattlePhase
 import com.droidnova.mathfight.game.BattleState
+import com.droidnova.mathfight.game.Difficulty
 import com.droidnova.mathfight.game.Fighter
 import com.droidnova.mathfight.game.STARTING_HP
 import com.droidnova.mathfight.game.PhaseKey
@@ -56,6 +57,8 @@ fun MathFightApp(
     search: MatchSearchState,
     onFindMatch: () -> Unit,
     onCancelMatch: () -> Unit,
+    difficulty: Difficulty,
+    onDifficulty: (Difficulty) -> Unit,
     state: BattleState,
     isResumed: Boolean,
     impactToken: PhaseKey?,
@@ -100,7 +103,8 @@ fun MathFightApp(
         BattlePhase.HOME -> if (searchingWithoutRoom) SearchScreen(displayName, search, onCancelMatch)
         else HomeScreen(onStart, settings, onSound, onVibration,
             debugConnection, serverUrl, connectionStatus, connectionMessage, onServerUrl, onConnect, onDisconnect,
-            roomCodeInput, room, roomError, onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom, onReady, onProfile, onFindMatch)
+            roomCodeInput, room, roomError, onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom, onReady, onProfile, onFindMatch,
+            difficulty, onDifficulty)
         BattlePhase.RESULT -> ResultScreen(state.winner, onRestart, onlineMatch != null, onlineSubmissionStatus, localName, opponentName)
         else -> BattleScreen(
             state = state,
@@ -116,6 +120,7 @@ fun MathFightApp(
             onSubmit = onSubmit
             ,online = onlineMatch != null, onlineAnswerLocked = onlineAnswerLocked,
             onlineSubmissionStatus = onlineSubmissionStatus,
+            difficulty = onlineMatch?.difficulty ?: difficulty,
             canRetry = onlineMatch != null && connectionStatus == BattleViewModel.ConnectionStatus.DISCONNECTED,
             onRetry = onConnect,
             localName = localName,
@@ -133,7 +138,7 @@ private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
                        roomCodeInput: String, room: RoomInfo?, roomError: String,
                        onRoomCode: (String) -> Unit, onCreateRoom: () -> Unit,
                        onJoinRoom: () -> Unit, onLeaveRoom: () -> Unit, onReady: () -> Unit, onProfile: () -> Unit,
-                       onFindMatch: () -> Unit) {
+                       onFindMatch: () -> Unit, difficulty: Difficulty, onDifficulty: (Difficulty) -> Unit) {
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(24.dp),
@@ -142,10 +147,11 @@ private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
         ) {
             Text("Math Fight", style = MaterialTheme.typography.displaySmall)
             TextButton(onClick = onProfile, enabled = room?.matchActive != true) { Text("Profile") }
+            DifficultySelector(difficulty, onDifficulty)
             if (debugConnection) {
-                ConnectionCheckPanel(serverUrl, connectionStatus, connectionMessage,
+            ConnectionCheckPanel(serverUrl, connectionStatus, connectionMessage,
                     onServerUrl, onConnect, onDisconnect, roomCodeInput, room, roomError,
-                    onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom, onReady)
+                    onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom, onReady, difficulty, onDifficulty)
             }
             Text(
                 "Solve. Strike. Win.",
@@ -206,6 +212,7 @@ private fun BattleScreen(
     online: Boolean,
     onlineAnswerLocked: Boolean,
     onlineSubmissionStatus: String,
+    difficulty: Difficulty,
     canRetry: Boolean,
     onRetry: () -> Unit,
     localName: String,
@@ -218,6 +225,7 @@ private fun BattleScreen(
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             HealthRow(state, isResumed, localName, opponentName)
+            Text("Mode: ${difficulty.name.lowercase().replaceFirstChar { it.uppercase() }}", style = MaterialTheme.typography.labelSmall)
             FeedbackControls(settings, onSound, onVibration)
             FighterArena(
                 state = state,
@@ -266,6 +274,7 @@ private fun SearchScreen(displayName: String, search: MatchSearchState, onCancel
             verticalArrangement = Arrangement.Center) {
             Text("Finding an opponent…", style = MaterialTheme.typography.headlineSmall)
             Text(displayName, modifier = Modifier.padding(top = 12.dp))
+            Text("Mode: ${search.difficulty.name.lowercase().replaceFirstChar { it.uppercase() }}")
             if (search.error.isNotBlank()) Text(search.error, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(top = 12.dp))
             OutlinedButton(onClick = onCancel, modifier = Modifier.padding(top = 24.dp)) { Text("Cancel Search") }
         }
@@ -287,7 +296,9 @@ private fun ConnectionCheckPanel(
     onCreateRoom: () -> Unit,
     onJoinRoom: () -> Unit,
     onLeaveRoom: () -> Unit,
-    onReady: () -> Unit
+    onReady: () -> Unit,
+    difficulty: Difficulty,
+    onDifficulty: (Difficulty) -> Unit
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
         Text("Connection check", style = MaterialTheme.typography.titleMedium)
@@ -313,6 +324,8 @@ private fun ConnectionCheckPanel(
         }
         if (status == BattleViewModel.ConnectionStatus.CONNECTED) {
             if (room == null) {
+                Text("Private room difficulty", style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(top = 8.dp))
+                DifficultySelector(difficulty, onDifficulty)
                 Button(onClick = onCreateRoom, modifier = Modifier.padding(top = 8.dp)) {
                     Text("Create Room")
                 }
@@ -333,6 +346,8 @@ private fun ConnectionCheckPanel(
                     modifier = Modifier.padding(top = 8.dp))
                 Text("Role: ${room.role}")
                 Text("Players: ${room.playerCount}/2")
+                Text("Difficulty: ${room.difficulty.name.lowercase().replaceFirstChar { it.uppercase() }}")
+                if (room.role.equals("Host", true) && !room.matchActive) DifficultySelector(room.difficulty, onDifficulty)
                 Text("Host: ${room.hostName} • ${if (room.hostReady) "Ready" else "Not ready"}")
                 Text("Guest: ${room.guestName.ifBlank { "Waiting…" }} • ${if (room.guestReady) "Ready" else "Not ready"}")
                 Text(if (room.playerCount == 2) "Both players connected" else "Waiting for opponent…")
@@ -345,6 +360,17 @@ private fun ConnectionCheckPanel(
             if (roomError.isNotEmpty()) {
                 Text(roomError, color = MaterialTheme.colorScheme.error,
                     style = MaterialTheme.typography.bodySmall)
+            }
+        }
+    }
+}
+
+@Composable
+private fun DifficultySelector(selected: Difficulty, onSelected: (Difficulty) -> Unit) {
+    Row(horizontalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.padding(vertical = 4.dp)) {
+        Difficulty.entries.forEach { value ->
+            TextButton(onClick = { onSelected(value) }) {
+                Text(if (value == selected) "[${value.name.lowercase().replaceFirstChar { it.uppercase() }}]" else value.name.lowercase().replaceFirstChar { it.uppercase() })
             }
         }
     }

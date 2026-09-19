@@ -5,6 +5,9 @@ import androidx.datastore.preferences.core.edit
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import java.util.UUID
+import com.droidnova.mathfight.game.Difficulty
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 
 private val Context.profileDataStore by preferencesDataStore(name = "player_profile")
 
@@ -24,6 +27,7 @@ class ProfileStore(context: Context) {
     private val store = context.applicationContext.profileDataStore
     private val idKey = stringPreferencesKey("profile_id")
     private val nameKey = stringPreferencesKey("display_name")
+    private val difficultyKey = stringPreferencesKey("difficulty")
 
     suspend fun load(): LocalProfile {
         val saved = store.edit { values ->
@@ -40,6 +44,14 @@ class ProfileStore(context: Context) {
             values[nameKey] = normalized
         }
         return LocalProfile(checkNotNull(saved[idKey]), normalized)
+    }
+
+    suspend fun loadDifficulty(): Difficulty = store.data.map { values ->
+        runCatching { Difficulty.valueOf(values[difficultyKey] ?: Difficulty.STANDARD.name) }.getOrDefault(Difficulty.STANDARD)
+    }.first()
+
+    suspend fun saveDifficulty(difficulty: Difficulty) {
+        store.edit { it[difficultyKey] = difficulty.name }
     }
 }
 
