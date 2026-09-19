@@ -59,6 +59,7 @@ class MainActivity : ComponentActivity() {
             val leaderboard by battleViewModel.leaderboard.collectAsStateWithLifecycle()
             val leaderboardOpen by battleViewModel.leaderboardOpen.collectAsStateWithLifecycle()
             val rankedResult by battleViewModel.rankedResult.collectAsStateWithLifecycle()
+            val xpResult by battleViewModel.xpResult.collectAsStateWithLifecycle()
             val view = LocalView.current
             var impactToken by remember { mutableStateOf<PhaseKey?>(null) }
             LaunchedEffect(onlinePaused) {
@@ -89,9 +90,9 @@ class MainActivity : ComponentActivity() {
                 }
             }
             MathFightTheme {
-                if (profile.loading || profile.loadFailed || profile.displayName.isBlank() || profile.editing) {
+                if (profile.loading || profile.loadFailed || profile.displayName.isBlank() || profile.showing) {
                     ProfileScreen(profile, battleViewModel::setProfileName, battleViewModel::saveProfile,
-                        battleViewModel::closeProfile, battleViewModel::loadProfile)
+                        battleViewModel::editProfileName, battleViewModel::closeProfile, battleViewModel::loadProfile)
                 } else {
                 MathFightApp(
                     displayName = profile.displayName,
@@ -102,6 +103,8 @@ class MainActivity : ComponentActivity() {
                     onLeaderboard = battleViewModel::openLeaderboard,
                     onCloseLeaderboard = battleViewModel::closeLeaderboard,
                     rankedResult = rankedResult,
+                    xpResult = xpResult,
+                    consumeXpAnimation = battleViewModel::consumeXpAnimation,
                     search = search,
                     onFindMatch = battleViewModel::findMatch,
                     onCancelMatch = battleViewModel::cancelMatch,

@@ -9,6 +9,7 @@ export class PlayerEntity {
   @Column({ default: 0 }) wins!: number;
   @Column({ default: 0 }) losses!: number;
   @Index() @Column({ default: 1000 }) rating!: number;
+  @Column({ name: 'total_xp', type: 'integer', default: 0 }) totalXp!: number;
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' }) createdAt!: Date;
   @UpdateDateColumn({ name: 'updated_at', type: 'timestamptz' }) updatedAt!: Date;
 }
@@ -32,6 +33,12 @@ export class CompletedMatchEntity {
   @Column({ name: 'host_rating_delta', type: 'smallint', nullable: true }) hostRatingDelta!: number | null;
   @Column({ name: 'guest_rating_delta', type: 'smallint', nullable: true }) guestRatingDelta!: number | null;
   @Column({ name: 'host_hp', type: 'smallint' }) hostHp!: number;
+  @Column({ name: 'host_xp_awarded', type: 'integer', default: 0 }) hostXpAwarded!: number;
+  @Column({ name: 'guest_xp_awarded', type: 'integer', default: 0 }) guestXpAwarded!: number;
+  @Column({ name: 'host_total_xp_before', type: 'integer', default: 0 }) hostTotalXpBefore!: number;
+  @Column({ name: 'guest_total_xp_before', type: 'integer', default: 0 }) guestTotalXpBefore!: number;
+  @Column({ name: 'host_total_xp_after', type: 'integer', default: 0 }) hostTotalXpAfter!: number;
+  @Column({ name: 'guest_total_xp_after', type: 'integer', default: 0 }) guestTotalXpAfter!: number;
   @Column({ name: 'guest_hp', type: 'smallint' }) guestHp!: number;
   @Index() @Column({ name: 'started_at', type: 'timestamptz' }) startedAt!: Date;
   @Index() @Column({ name: 'completed_at', type: 'timestamptz' }) completedAt!: Date;

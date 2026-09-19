@@ -8,6 +8,9 @@ import androidx.lifecycle.viewModelScope
 import com.droidnova.mathfight.profile.LocalProfile
 import com.droidnova.mathfight.profile.ProfileStore
 import com.droidnova.mathfight.profile.ProfileUiState
+import com.droidnova.mathfight.profile.XpResult
+import com.droidnova.mathfight.profile.parseProgression
+import com.droidnova.mathfight.profile.parseXpResult
 import com.droidnova.mathfight.profile.NAME_VALIDATION_MESSAGE
 import com.droidnova.mathfight.profile.normalizedPlayerName
 import kotlinx.coroutines.CancellationException
@@ -93,11 +96,15 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     val leaderboardOpen = mutableLeaderboardOpen.asStateFlow()
     private val mutableRankedResult = MutableStateFlow(RankedResult())
     val rankedResult = mutableRankedResult.asStateFlow()
+    private val mutableXpResult = MutableStateFlow<XpResult?>(null)
+    val xpResult = mutableXpResult.asStateFlow()
+    private var consumedXpMatchId: String? = null
+    private var profileStatsRequest = 0L
+    private var profileStatsTimeout: Job? = null
     private val mutableDifficulty = MutableStateFlow(Difficulty.STANDARD)
     val difficulty = mutableDifficulty.asStateFlow()
     private val mutableState = MutableStateFlow(BattleState())
     val state = mutableState.asStateFlow()
-
     private val resumed = MutableStateFlow(false)
     val isResumed = resumed.asStateFlow()
 
@@ -178,8 +185,12 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
 
     fun openProfile() {
         if (state.value.phase != BattlePhase.HOME || room.value?.matchActive == true || profile.value.loading) return
-        mutableProfile.value = profile.value.copy(editing = true, nameInput = profile.value.displayName, error = "", statsLoading = true)
+        mutableProfile.value = profile.value.copy(showing = true, editing = false, nameInput = profile.value.displayName, error = "", statsLoading = true)
         fetchProfileStats()
+    }
+
+    fun editProfileName() {
+        if (!profile.value.saving) mutableProfile.value = profile.value.copy(editing = true, nameInput = profile.value.displayName, error = "")
     }
 
     fun openLeaderboard() {
@@ -206,7 +217,10 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     }
 
     fun closeProfile() {
-        if (!profile.value.saving) mutableProfile.value = profile.value.copy(editing = false, error = "")
+        if (profile.value.saving) return
+        mutableProfile.value = if (profile.value.editing) {
+            profile.value.copy(editing = false, nameInput = profile.value.displayName, error = "")
+        } else profile.value.copy(showing = false, error = "")
     }
 
     fun setProfileName(value: String) {
@@ -261,15 +275,29 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     }
 
     private fun fetchProfileStats() {
+        val request = ++profileStatsRequest
+        val generation = connectionGeneration
+        val operation = sessionOperation
+        profileStatsTimeout?.cancel()
         val current = socket
         if (current?.connected() != true || !sessionReady) {
             mutableProfile.value = profile.value.copy(statsLoading = false, stats = null)
             return
         }
+        mutableProfile.value = profile.value.copy(statsLoading = true)
+        profileStatsTimeout = viewModelScope.launch {
+            delay(5_000)
+            if (request == profileStatsRequest) {
+                profileStatsRequest++
+                mutableProfile.value = profile.value.copy(statsLoading = false, stats = null)
+            }
+        }
         current.emit("profile:stats", io.socket.client.Ack { args ->
             mainHandler.post {
+                if (request != profileStatsRequest || generation != connectionGeneration || operation != sessionOperation || socket !== current || !sessionReady) return@post
+                profileStatsTimeout?.cancel()
                 val response = args.firstOrNull() as? JSONObject
-                if (socket !== current || response?.optBoolean("ok") != true) {
+                if (response?.optBoolean("ok") != true) {
                     mutableProfile.value = profile.value.copy(statsLoading = false, stats = null)
                     return@post
                 }
@@ -277,9 +305,9 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                 val rows = response.optJSONArray("matches")
                 for (index in 0 until (rows?.length() ?: 0)) {
                     val row = rows?.optJSONObject(index) ?: continue
-                    recent += com.droidnova.mathfight.profile.ProfileMatchStat(row.optString("result"), row.optString("opponentName"), row.optString("difficulty"), row.optString("finishReason"), row.optString("matchType", "UNRANKED"), if (row.isNull("ratingChange")) null else row.optInt("ratingChange"))
+                    recent += com.droidnova.mathfight.profile.ProfileMatchStat(row.optString("localName", profile.value.displayName), row.optString("result"), row.optString("opponentName"), row.optString("difficulty"), row.optString("finishReason"), row.optString("matchType", "UNRANKED"), if (row.isNull("ratingChange")) null else row.optInt("ratingChange"), row.optJSONObject("progression")?.let { parseXpResult(row.optString("matchId"), it) })
                 }
-                mutableProfile.value = profile.value.copy(statsLoading = false, stats = com.droidnova.mathfight.profile.ProfileStats(response.optInt("matchesPlayed"), response.optInt("wins"), response.optInt("losses"), response.optDouble("winRate"), recent, response.optInt("rating", 1000), response.optString("tier", "Silver"), response.optInt("leaderboardPosition")))
+                mutableProfile.value = profile.value.copy(statsLoading = false, stats = com.droidnova.mathfight.profile.ProfileStats(response.optInt("matchesPlayed"), response.optInt("wins"), response.optInt("losses"), response.optDouble("winRate"), recent, response.optInt("rating", 1000), response.optString("tier", "Silver"), response.optInt("leaderboardPosition"), parseProgression(response)))
             }
         })
     }
@@ -572,6 +600,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     }
 
     private fun clearOnlineMatch() {
+        mutableXpResult.value = null
         onlineResolutionJob?.cancel()
         onlineResultJob?.cancel()
         mutableOnlineMatch.value = null
@@ -797,7 +826,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         val revision = value.optLong("revision")
         if (value.optString("matchId") != info.matchId || revision <= onlineRevision) return
         if (value.optString("message").isNotBlank() || onlinePaused.value) {
-            applyOnlineSnapshot(value)
+            applyOnlineSnapshot(value, recovered = false)
             return
         }
         onlineRevision = revision
@@ -818,7 +847,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         }
     }
 
-    private fun applyOnlineSnapshot(value: JSONObject) {
+    private fun applyOnlineSnapshot(value: JSONObject, recovered: Boolean = true) {
         if (!sessionReady) return
         val info = mutableOnlineMatch.value ?: return
         if (value.optString("matchId") != info.matchId) return
@@ -871,6 +900,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                 }
             }
             "result" -> {
+                if (recovered) consumedXpMatchId = info.matchId
                 mutableOnlineAnswerLocked.value = true
                 val winner = value.optString("winner")
                 onlineResult = winner
@@ -884,14 +914,37 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     }
 
     private fun applyRankedResult(value: JSONObject) {
+        applyXpResult(value)
         if (value.optString("matchType") != "RANKED") { mutableRankedResult.value = RankedResult(); return }
         val rating = value.optJSONObject("rating")
         if (rating == null) { mutableRankedResult.value = RankedResult(ranked = true); return }
-        val role = roleForSocket(); val host = role.equals("host", true)
+        val role = onlineMatch.value?.role; val host = role.equals("host", true)
         mutableRankedResult.value = RankedResult(true, true, rating.optInt(if (host) "hostRatingBefore" else "guestRatingBefore", 1000), rating.optInt(if (host) "hostRatingDelta" else "guestRatingDelta"), rating.optInt(if (host) "hostRatingAfter" else "guestRatingAfter", 1000), if (host) tierForRating(rating.optInt("hostRatingAfter", 1000)) else tierForRating(rating.optInt("guestRatingAfter", 1000)))
     }
 
     private fun tierForRating(rating: Int) = when { rating < 900 -> "Bronze"; rating < 1100 -> "Silver"; rating < 1300 -> "Gold"; rating < 1500 -> "Platinum"; else -> "Diamond" }
+
+    private fun applyXpResult(value: JSONObject) {
+        val info = onlineMatch.value ?: return
+        if (value.optString("matchId") != info.matchId) return
+        mutableXpResult.value = value.optJSONObject("progression")?.let { parseXpResult(info.matchId, it) }
+    }
+
+    fun consumeXpAnimation(matchId: String): Boolean {
+        if (!resumed.value || state.value.phase != BattlePhase.RESULT || onlineMatch.value?.matchId != matchId ||
+            mutableXpResult.value?.matchId != matchId || consumedXpMatchId == matchId) return false
+        consumedXpMatchId = matchId
+        return true
+    }
+
+    private fun handleMatchSettled(value: JSONObject) {
+        val info = onlineMatch.value ?: return
+        if (!sessionReady || value.optString("matchId") != info.matchId || value.optLong("revision") <= onlineRevision) return
+        onlineRevision = value.optLong("revision")
+        // Settlement changes presentation data only; keep the existing KO/result timeline.
+        applyRankedResult(value)
+        fetchProfileStats()
+    }
 
     private fun acknowledgeFreshQuestion(value: JSONObject) {
         val current = socket ?: return
@@ -980,6 +1033,9 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         }
         created.on("match:result") { args ->
             mainHandler.post { if (generation == connectionGeneration && socket === created && args.firstOrNull() is JSONObject) handleMatchResult(args[0] as JSONObject) }
+        }
+        created.on("match:settled") { args ->
+            mainHandler.post { if (generation == connectionGeneration && socket === created && args.firstOrNull() is JSONObject) handleMatchSettled(args[0] as JSONObject) }
         }
         created.on("match:snapshot") { args ->
             mainHandler.post { if (generation == connectionGeneration && socket === created && args.firstOrNull() is JSONObject) applyOnlineSnapshot(args[0] as JSONObject) }
@@ -1149,6 +1205,9 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     }
 
     private fun disposeSocket(status: ConnectionStatus) {
+        profileStatsRequest++
+        profileStatsTimeout?.cancel()
+        mutableProfile.value = profile.value.copy(statsLoading = false, stats = null)
         connectionGeneration++
         sessionOperation++
         sessionReady = false

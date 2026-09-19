@@ -3,11 +3,12 @@ import { OnApplicationShutdown } from '@nestjs/common';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Socket } from 'socket.io';
 import { AccountService } from './account.service';
+import { progressionResult } from './progression';
 
 type Role = 'host' | 'guest';
 type Difficulty = 'EASY' | 'STANDARD' | 'EXPERT';
 type Question = { matchId: string; questionId: number; left: number; operation: 'ADD' | 'SUBTRACT' | 'MULTIPLY' | 'DIVIDE'; right: number };
-type Match = { matchId: string; difficulty: Difficulty; ranked: boolean; hostName: string; guestName: string; question: Question; phase: 'answering' | 'resolving' | 'paused' | 'resuming' | 'result'; hostHp: number; guestHp: number; revision: number; attacker?: Role; winner?: Role; message?: string; startedAt: Date; timer?: NodeJS.Timeout; requests: Map<string, object>; received: Set<string> };
+type Match = { matchId: string; difficulty: Difficulty; ranked: boolean; hostName: string; guestName: string; question: Question; phase: 'answering' | 'resolving' | 'paused' | 'resuming' | 'result'; hostHp: number; guestHp: number; revision: number; attacker?: Role; winner?: Role; message?: string; startedAt: Date; timer?: NodeJS.Timeout; requests: Map<string, object>; received: Set<string>; rating?: object; hostProgression?: ReturnType<typeof progressionResult>; guestProgression?: ReturnType<typeof progressionResult> };
 type Player = { id: string; token: string; profileId?: string; displayName?: string; accountId?: string; rating?: number; searchId?: string; socket?: Socket; roomCode?: string; deadline?: number; graceTimer?: NodeJS.Timeout };
 type Room = { code: string; difficulty: Difficulty; ranked: boolean; host: Player; guest?: Player; hostReady: boolean; guestReady: boolean; match?: Match };
 type SearchEntry = { player: Player; searchId: string; difficulty: Difficulty; joinedAt: number };
@@ -77,7 +78,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     const room = player.roomCode ? this.rooms.get(player.roomCode) : undefined;
     return { ok: true, playerId: player.id, resumeToken: player.token,
       room: room ? this.roomState(room, player) : undefined,
-      snapshot: room?.match ? this.snapshot(room.match, room) : undefined };
+      snapshot: room?.match ? this.snapshot(room.match, room, room.host === player ? 'host' : 'guest') : undefined };
   }
 
   @SubscribeMessage('session:leave')
@@ -377,10 +378,11 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
 
   @SubscribeMessage('match:state')
   matchState(@ConnectedSocket() client: Socket) {
-    const code = this.playerFor(client)?.roomCode;
+    const player = this.playerFor(client);
+    const code = player?.roomCode;
     const room = code ? this.rooms.get(code) : undefined;
     if (!room?.match) return { ok: false, result: 'ended', error: 'match unavailable' };
-    return { ok: true, snapshot: this.snapshot(room.match, room) };
+    return { ok: true, snapshot: this.snapshot(room.match, room, room.host === player ? 'host' : 'guest') };
   }
 
   private leaveRoom(player: Player): string | undefined {
@@ -449,24 +451,37 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     match.winner = attacker;
     match.message = message;
     match.revision++;
-    let rating: object | undefined;
-    try {
-      const recorded = await this.accounts.recordMatch({ matchId: match.matchId, hostId: room.host.accountId, guestId: room.guest?.accountId, hostName: match.hostName, guestName: match.guestName, winnerId: attacker === 'host' ? room.host.accountId : room.guest?.accountId, difficulty: match.difficulty, finishReason: message ? 'forfeit' : 'normal', hostHp: match.hostHp, guestHp: match.guestHp, startedAt: match.startedAt, matchType: match.ranked ? 'RANKED' : 'UNRANKED' });
-      if (recorded) rating = recorded;
-      if (match.ranked && recorded?.recorded) { room.host.rating = recorded.hostRatingAfter ?? room.host.rating; if (room.guest) room.guest.rating = recorded.guestRatingAfter ?? room.guest.rating; }
-    } catch { rating = undefined; }
-    this.broadcastMatch(room, 'match:result', { ...this.snapshot(match, room), matchType: match.ranked ? 'RANKED' : 'UNRANKED', rating });
+    // Cleanup may remove the room/guest while persistence is in flight.
+    const host = room.host;
+    const guest = room.guest;
     room.hostReady = false;
     room.guestReady = false;
+    host.socket?.emit('match:result', this.snapshot(match, room, 'host'));
+    guest?.socket?.emit('match:result', this.snapshot(match, room, 'guest'));
     this.emitState(room.code);
+    try {
+      const recorded = await this.accounts.recordMatch({ matchId: match.matchId, hostId: host.accountId, guestId: guest?.accountId, hostName: match.hostName, guestName: match.guestName, winnerId: attacker === 'host' ? host.accountId : guest?.accountId, difficulty: match.difficulty, finishReason: message && match.hostHp > 0 && match.guestHp > 0 ? 'forfeit' : 'normal', hostHp: match.hostHp, guestHp: match.guestHp, startedAt: match.startedAt, matchType: match.ranked ? 'RANKED' : 'UNRANKED' });
+      if (recorded) {
+        const { hostProgression, guestProgression, ...rating } = recorded;
+        match.rating = rating;
+        match.hostProgression = hostProgression;
+        match.guestProgression = guestProgression;
+        if (match.ranked) { host.rating = recorded.hostRatingAfter ?? host.rating; if (guest) guest.rating = recorded.guestRatingAfter ?? guest.rating; }
+      }
+    } catch { /* Result remains valid; no progression is fabricated on persistence failure. */ }
+    match.revision++;
+    host.socket?.emit('match:settled', this.snapshot(match, room, 'host'));
+    guest?.socket?.emit('match:settled', this.snapshot(match, room, 'guest'));
+    if (room.match === match) this.emitState(room.code);
   }
 
-  private snapshot(match: Match, room?: Room) {
+  private snapshot(match: Match, room?: Room, role?: Role) {
     const deadlines = [room?.host.deadline, room?.guest?.deadline].filter((value): value is number => value !== undefined);
     return { matchId: match.matchId, difficulty: match.difficulty, questionId: match.question.questionId, phase: match.phase,
       hostName: match.hostName, guestName: match.guestName, hostRating: room?.host.rating ?? 1000, guestRating: room?.guest?.rating ?? 1000, hostTier: this.tier(room?.host.rating ?? 1000), guestTier: this.tier(room?.guest?.rating ?? 1000),
       question: { left: match.question.left, operation: match.question.operation, right: match.question.right },
       playerHp: match.hostHp, opponentHp: match.guestHp, attacker: match.attacker, winner: match.winner, revision: match.revision,
+      rating: match.rating, progression: role === 'host' ? match.hostProgression : role === 'guest' ? match.guestProgression : undefined,
       message: match.message, ranked: match.ranked, matchType: match.ranked ? 'RANKED' : 'UNRANKED', deadline: deadlines.length ? Math.min(...deadlines) : undefined, serverNow: Date.now() };
   }
 

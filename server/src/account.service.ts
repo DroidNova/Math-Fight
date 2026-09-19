@@ -3,6 +3,7 @@ import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
 import { createHash, randomBytes } from 'node:crypto';
 import { CompletedMatchEntity, PlayerEntity } from './entities';
+import { progression, progressionResult } from './progression';
 
 @Injectable()
 export class AccountService {
@@ -20,7 +21,8 @@ export class AccountService {
     } else {
       if (!rawToken || this.hash(rawToken) !== player.accountTokenHash) throw new Error('Invalid account token');
       player.displayName = displayName;
-      await this.players.save(player);
+      // A profile sync must not overwrite XP/rating committed since this row was read.
+      await this.players.update(player.id, { displayName });
     }
     return { player, issuedToken };
   }
@@ -28,12 +30,20 @@ export class AccountService {
   async recordMatch(input: { matchId: string; hostId?: string; guestId?: string; hostName: string; guestName: string; winnerId?: string; difficulty: string; finishReason: 'normal'|'forfeit'; hostHp: number; guestHp: number; startedAt: Date; matchType: 'RANKED'|'UNRANKED' }) {
     if (!input.hostId || !input.guestId || !input.winnerId) return undefined;
     return this.dataSource.transaction(async manager => {
-      const existing = await manager.findOne(CompletedMatchEntity, { where: { matchId: input.matchId } });
-      if (existing) return { recorded: false, matchType: existing.matchType, hostRatingBefore: existing.hostRatingBefore, guestRatingBefore: existing.guestRatingBefore, hostRatingAfter: existing.hostRatingAfter, guestRatingAfter: existing.guestRatingAfter, hostRatingDelta: existing.hostRatingDelta, guestRatingDelta: existing.guestRatingDelta };
+      let existing = await manager.findOne(CompletedMatchEntity, { where: { matchId: input.matchId } });
+      if (existing) return this.completedResult(existing, false);
       const loserId = input.winnerId === input.hostId ? input.guestId : input.hostId;
-      const host = await manager.findOne(PlayerEntity, { where: { id: input.hostId }, lock: { mode: 'pessimistic_write' } });
-      const guest = await manager.findOne(PlayerEntity, { where: { id: input.guestId }, lock: { mode: 'pessimistic_write' } });
+      // Stable lock ordering prevents deadlocks when the same players swap roles.
+      const locked = new Map<string, PlayerEntity>();
+      for (const id of [input.hostId, input.guestId].sort()) {
+        const player = await manager.findOne(PlayerEntity, { where: { id }, lock: { mode: 'pessimistic_write' } });
+        if (player) locked.set(id!, player);
+      }
+      const host = locked.get(input.hostId!);
+      const guest = locked.get(input.guestId!);
       if (!host || !guest) return undefined;
+      existing = await manager.findOne(CompletedMatchEntity, { where: { matchId: input.matchId } });
+      if (existing) return this.completedResult(existing, false);
       const ranked = input.matchType === 'RANKED';
       const hostBefore = host.rating;
       const guestBefore = guest.rating;
@@ -42,12 +52,28 @@ export class AccountService {
       const delta = ranked ? Math.round(32 * (1 - 1 / (1 + Math.pow(10, (loserBefore - winnerBefore) / 400)))) : 0;
       const hostAfter = ranked ? (input.winnerId === host.id ? host.rating + delta : Math.max(0, host.rating - delta)) : host.rating;
       const guestAfter = ranked ? (input.winnerId === guest.id ? guest.rating + delta : Math.max(0, guest.rating - delta)) : guest.rating;
-      await manager.insert(CompletedMatchEntity, { matchId: input.matchId, hostPlayerId: input.hostId, guestPlayerId: input.guestId, hostName: input.hostName, guestName: input.guestName, winnerId: input.winnerId, difficulty: input.difficulty, finishReason: input.finishReason, matchType: input.matchType, hostRatingBefore: ranked ? hostBefore : null, guestRatingBefore: ranked ? guestBefore : null, hostRatingAfter: ranked ? hostAfter : null, guestRatingAfter: ranked ? guestAfter : null, hostRatingDelta: ranked ? hostAfter - hostBefore : null, guestRatingDelta: ranked ? guestAfter - guestBefore : null, hostHp: input.hostHp, guestHp: input.guestHp, startedAt: input.startedAt, completedAt: new Date() });
+      const winnerXp = ranked ? (input.finishReason === 'forfeit' ? 70 : 100) : 0;
+      const loserXp = ranked && input.finishReason === 'normal' ? 40 : 0;
+      const hostXpAwarded = input.winnerId === host.id ? winnerXp : loserXp;
+      const guestXpAwarded = input.winnerId === guest.id ? winnerXp : loserXp;
+      const completed = manager.create(CompletedMatchEntity, { matchId: input.matchId, hostPlayerId: input.hostId, guestPlayerId: input.guestId, hostName: input.hostName, guestName: input.guestName, winnerId: input.winnerId, difficulty: input.difficulty, finishReason: input.finishReason, matchType: input.matchType, hostRatingBefore: ranked ? hostBefore : null, guestRatingBefore: ranked ? guestBefore : null, hostRatingAfter: ranked ? hostAfter : null, guestRatingAfter: ranked ? guestAfter : null, hostRatingDelta: ranked ? hostAfter - hostBefore : null, guestRatingDelta: ranked ? guestAfter - guestBefore : null, hostHp: input.hostHp, guestHp: input.guestHp, startedAt: input.startedAt, completedAt: new Date(), hostXpAwarded, guestXpAwarded, hostTotalXpBefore: host.totalXp, guestTotalXpBefore: guest.totalXp, hostTotalXpAfter: host.totalXp + hostXpAwarded, guestTotalXpAfter: guest.totalXp + guestXpAwarded });
+      await manager.insert(CompletedMatchEntity, completed);
       await manager.increment(PlayerEntity, { id: input.winnerId }, 'wins', 1);
       await manager.increment(PlayerEntity, { id: loserId }, 'losses', 1);
       if (ranked) { await manager.update(PlayerEntity, { id: host.id }, { rating: hostAfter }); await manager.update(PlayerEntity, { id: guest.id }, { rating: guestAfter }); }
-      return { recorded: true, matchType: input.matchType, hostRatingBefore: ranked ? hostBefore : null, guestRatingBefore: ranked ? guestBefore : null, hostRatingAfter: ranked ? hostAfter : null, guestRatingAfter: ranked ? guestAfter : null, hostRatingDelta: ranked ? hostAfter - hostBefore : null, guestRatingDelta: ranked ? guestAfter - guestBefore : null };
+      await manager.update(PlayerEntity, { id: host.id }, { totalXp: completed.hostTotalXpAfter });
+      await manager.update(PlayerEntity, { id: guest.id }, { totalXp: completed.guestTotalXpAfter });
+      return this.completedResult(completed, true);
     });
+  }
+
+  private completedResult(match: CompletedMatchEntity, recorded: boolean) {
+    return { recorded, matchType: match.matchType, hostRatingBefore: match.hostRatingBefore,
+      guestRatingBefore: match.guestRatingBefore, hostRatingAfter: match.hostRatingAfter,
+      guestRatingAfter: match.guestRatingAfter, hostRatingDelta: match.hostRatingDelta,
+      guestRatingDelta: match.guestRatingDelta,
+      hostProgression: progressionResult(match.hostTotalXpBefore, match.hostTotalXpAfter, match.hostXpAwarded),
+      guestProgression: progressionResult(match.guestTotalXpBefore, match.guestTotalXpAfter, match.guestXpAwarded) };
   }
 
   async stats(playerId: string) {
@@ -55,7 +81,7 @@ export class AccountService {
     if (!player) return undefined;
     const matches = await this.matches.find({ where: [{ hostPlayerId: playerId }, { guestPlayerId: playerId }], order: { completedAt: 'DESC' }, take: 10 });
     const position = await this.position(player);
-    return { matchesPlayed: player.wins + player.losses, wins: player.wins, losses: player.losses, rating: player.rating, tier: this.tier(player.rating), leaderboardPosition: position, winRate: player.wins + player.losses ? player.wins / (player.wins + player.losses) : 0, matches: matches.map(match => ({ matchId: match.matchId, result: match.winnerId === playerId ? 'WIN' : 'LOSS', opponentName: match.hostPlayerId === playerId ? match.guestName : match.hostName, difficulty: match.difficulty, finishReason: match.finishReason, matchType: match.matchType, ratingChange: match.hostPlayerId === playerId ? match.hostRatingDelta : match.guestRatingDelta, completedAt: match.completedAt })) };
+    return { ...progression(player.totalXp), matchesPlayed: player.wins + player.losses, wins: player.wins, losses: player.losses, rating: player.rating, tier: this.tier(player.rating), leaderboardPosition: position, winRate: player.wins + player.losses ? player.wins / (player.wins + player.losses) : 0, matches: matches.map(match => ({ matchId: match.matchId, localName: match.hostPlayerId === playerId ? match.hostName : match.guestName, result: match.winnerId === playerId ? 'WIN' : 'LOSS', opponentName: match.hostPlayerId === playerId ? match.guestName : match.hostName, difficulty: match.difficulty, finishReason: match.finishReason, matchType: match.matchType, ratingChange: match.hostPlayerId === playerId ? match.hostRatingDelta : match.guestRatingDelta, progression: match.hostPlayerId === playerId ? this.completedResult(match, false).hostProgression : this.completedResult(match, false).guestProgression, completedAt: match.completedAt })) };
   }
 
   async leaderboard(playerId: string) {

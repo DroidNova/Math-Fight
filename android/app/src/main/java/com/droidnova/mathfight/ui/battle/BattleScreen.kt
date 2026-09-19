@@ -48,6 +48,8 @@ import com.droidnova.mathfight.game.Fighter
 import com.droidnova.mathfight.game.STARTING_HP
 import com.droidnova.mathfight.game.PhaseKey
 import com.droidnova.mathfight.profile.ProfileStats
+import com.droidnova.mathfight.profile.XpResult
+import com.droidnova.mathfight.profile.XpResultPanel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 
@@ -61,6 +63,8 @@ fun MathFightApp(
     onLeaderboard: () -> Unit,
     onCloseLeaderboard: () -> Unit,
     rankedResult: RankedResult,
+    xpResult: XpResult?,
+    consumeXpAnimation: (String) -> Boolean,
     search: MatchSearchState,
     onFindMatch: () -> Unit,
     onCancelMatch: () -> Unit,
@@ -114,7 +118,7 @@ fun MathFightApp(
             debugConnection, serverUrl, connectionStatus, connectionMessage, onServerUrl, onConnect, onDisconnect,
             roomCodeInput, room, roomError, onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom, onReady, onProfile, onFindMatch,
             difficulty, onDifficulty, onLeaderboard)
-        BattlePhase.RESULT -> ResultScreen(state.winner, onRestart, onFindNewOpponent, onlineMatch != null, onlineSubmissionStatus, localName, opponentName, rankedResult)
+        BattlePhase.RESULT -> ResultScreen(state.winner, onRestart, onFindNewOpponent, onlineMatch != null, onlineSubmissionStatus, localName, opponentName, rankedResult, xpResult, isResumed, consumeXpAnimation)
         else -> BattleScreen(
             state = state,
             isResumed = isResumed,
@@ -183,10 +187,11 @@ private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
 
 @Composable
 private fun ResultScreen(winner: Fighter?, onRestart: () -> Unit, onFindNewOpponent: () -> Unit, online: Boolean, message: String,
-                         localName: String, opponentName: String, rankedResult: RankedResult) {
+                         localName: String, opponentName: String, rankedResult: RankedResult,
+                         xpResult: XpResult?, isResumed: Boolean, consumeXpAnimation: (String) -> Boolean) {
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(
-            modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
+            modifier = Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(24.dp),
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
@@ -196,10 +201,14 @@ private fun ResultScreen(winner: Fighter?, onRestart: () -> Unit, onFindNewOppon
             )
             Text("$localName vs $opponentName", modifier = Modifier.padding(top = 12.dp), textAlign = TextAlign.Center)
             if (online && message.isNotBlank()) Text(message, modifier = Modifier.padding(top = 12.dp))
-            if (rankedResult.ranked) {
+            if (online && rankedResult.ranked) {
                 if (rankedResult.available) Text("Rating ${rankedResult.before} ${if (rankedResult.delta >= 0) "+${rankedResult.delta}" else rankedResult.delta} → ${rankedResult.after}\n${rankedResult.tier}", modifier = Modifier.padding(top = 12.dp), textAlign = TextAlign.Center)
                 else Text("Rating unavailable", modifier = Modifier.padding(top = 12.dp))
             }
+            if (online && rankedResult.ranked) {
+                if (xpResult != null) XpResultPanel(xpResult, isResumed, consumeXpAnimation)
+                else Text("XP temporarily unavailable", modifier = Modifier.padding(top = 12.dp))
+            } else Text("Unranked — no XP", modifier = Modifier.padding(top = 12.dp))
             if (online && rankedResult.ranked) {
                 Button(onClick = onFindNewOpponent, modifier = Modifier.padding(top = 28.dp).heightIn(min = 48.dp)) { Text("Find New Opponent") }
                 OutlinedButton(onClick = onRestart, modifier = Modifier.padding(top = 8.dp).heightIn(min = 48.dp)) { Text("Return to Home") }
