@@ -28,6 +28,7 @@ class ProfileStore(context: Context) {
     private val idKey = stringPreferencesKey("profile_id")
     private val nameKey = stringPreferencesKey("display_name")
     private val difficultyKey = stringPreferencesKey("difficulty")
+    private val accountTokenKey = stringPreferencesKey("account_token")
 
     suspend fun load(): LocalProfile {
         val saved = store.edit { values ->
@@ -53,7 +54,13 @@ class ProfileStore(context: Context) {
     suspend fun saveDifficulty(difficulty: Difficulty) {
         store.edit { it[difficultyKey] = difficulty.name }
     }
+
+    suspend fun loadAccountToken(): String? = store.data.map { it[accountTokenKey] }.first()
+    suspend fun saveAccountToken(token: String) { store.edit { it[accountTokenKey] = token } }
 }
+
+data class ProfileMatchStat(val result: String, val opponentName: String, val difficulty: String, val finishReason: String)
+data class ProfileStats(val matchesPlayed: Int, val wins: Int, val losses: Int, val winRate: Double, val matches: List<ProfileMatchStat>)
 
 data class ProfileUiState(
     val loading: Boolean = true,
@@ -62,5 +69,7 @@ data class ProfileUiState(
     val editing: Boolean = false,
     val nameInput: String = "",
     val saving: Boolean = false,
-    val error: String = ""
+    val error: String = "",
+    val statsLoading: Boolean = false,
+    val stats: ProfileStats? = null
 )

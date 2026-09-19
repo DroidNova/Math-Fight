@@ -34,6 +34,20 @@ In Android Studio, allow Gradle sync to complete, select an emulator or connecte
 
 From `server/`, run `npm run start:dev`. The server listens on port 3000 by default (`PORT` may override it). For a phone on the same Wi-Fi, run `ipconfig` on the laptop, find its Wi-Fi IPv4 address, and enter `http://<laptop-ip>:3000` in the debug-only Connection check on the launch screen. An emulator uses `http://10.0.2.2:3000`. If needed, allow Node through Windows Firewall on private networks; do not change firewall settings automatically.
 
+## Milestone 12 local database
+
+Start PostgreSQL and the server with the existing data volume:
+
+```powershell
+docker compose up -d postgres
+cd server
+$env:DB_PORT = "5433"
+npm run migration:run
+npm run start:dev
+```
+
+Copy `server/.env.example` to `server/.env` only when overriding the local defaults. The server stores anonymous account tokens as hashes and keeps player statistics in PostgreSQL; offline battles continue without the backend.
+
 The debug Connection check also supports creating or joining one two-player local room. It only provides lobby presence in this milestone; Start Battle remains the offline bot mode.
 
 When both room members tap Ready, the server starts the first online question. Answers, HP, attacks, and results are server-authoritative; Start Battle remains the offline bot mode.
@@ -53,3 +67,15 @@ The existing socket synchronizes the saved profile after connection/resume. Lobb
 ## Milestone 11 difficulty modes
 
 Easy, Standard, and Expert are shared by offline questions, private rooms, and random matchmaking. Standard is the default and the last selection is saved with the profile preferences. Expert adds exact whole-number division; the server remains authoritative for online answers. Private-room hosts choose the mode and guests inherit it; matchmaking queues are separated by mode. Install the updated APK on both phones and restart the server when changing this protocol.
+## Milestone 12 local database
+
+Start PostgreSQL and the server with the existing data volume:
+
+```powershell
+docker compose up -d postgres
+cd server
+npm run migration:run
+npm run start:dev
+```
+
+Copy `server/.env.example` to `server/.env` only when overriding the local defaults. The server stores anonymous account tokens as hashes and keeps player statistics in PostgreSQL; offline battles continue without the backend.

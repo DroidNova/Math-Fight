@@ -96,7 +96,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     private var consumedImpact: PhaseKey? = null
 
     enum class ConnectionStatus { IDLE, CONNECTING, CONNECTED, DISCONNECTED, ERROR }
-    private val mutableServerUrl = MutableStateFlow("http://192.168.1.7:3000")
+    private val mutableServerUrl = MutableStateFlow("http://192.168.1.4:3000")
     val serverUrl = mutableServerUrl.asStateFlow()
     private val mutableConnectionStatus = MutableStateFlow(ConnectionStatus.IDLE)
     val connectionStatus = mutableConnectionStatus.asStateFlow()
@@ -162,7 +162,8 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
 
     fun openProfile() {
         if (state.value.phase != BattlePhase.HOME || room.value?.matchActive == true || profile.value.loading) return
-        mutableProfile.value = profile.value.copy(editing = true, nameInput = profile.value.displayName, error = "")
+        mutableProfile.value = profile.value.copy(editing = true, nameInput = profile.value.displayName, error = "", statsLoading = true)
+        fetchProfileStats()
     }
 
     fun closeProfile() {
@@ -220,13 +221,40 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         }
     }
 
+    private fun fetchProfileStats() {
+        val current = socket
+        if (current?.connected() != true || !sessionReady) {
+            mutableProfile.value = profile.value.copy(statsLoading = false, stats = null)
+            return
+        }
+        current.emit("profile:stats", io.socket.client.Ack { args ->
+            mainHandler.post {
+                val response = args.firstOrNull() as? JSONObject
+                if (socket !== current || response?.optBoolean("ok") != true) {
+                    mutableProfile.value = profile.value.copy(statsLoading = false, stats = null)
+                    return@post
+                }
+                val recent = mutableListOf<com.droidnova.mathfight.profile.ProfileMatchStat>()
+                val rows = response.optJSONArray("matches")
+                for (index in 0 until (rows?.length() ?: 0)) {
+                    val row = rows?.optJSONObject(index) ?: continue
+                    recent += com.droidnova.mathfight.profile.ProfileMatchStat(row.optString("result"), row.optString("opponentName"), row.optString("difficulty"), row.optString("finishReason"))
+                }
+                mutableProfile.value = profile.value.copy(statsLoading = false, stats = com.droidnova.mathfight.profile.ProfileStats(response.optInt("matchesPlayed"), response.optInt("wins"), response.optInt("losses"), response.optDouble("winRate"), recent))
+            }
+        })
+    }
+
     private suspend fun synchronizeProfile(current: Socket, value: LocalProfile): JSONObject {
         val generation = connectionGeneration
         val operation = sessionOperation
         if (socket !== current || !current.connected()) throw ProfileSyncFailure("Connection changed. Try again.")
+        val accountToken = profileStore.loadAccountToken()
         val response = withTimeout(3_000) {
             suspendCancellableCoroutine<JSONObject> { continuation ->
-                current.emit("profile:sync", JSONObject().put("profileId", value.id).put("displayName", value.displayName),
+                val payload = JSONObject().put("profileId", value.id).put("displayName", value.displayName)
+                if (accountToken != null) payload.put("accountToken", accountToken)
+                current.emit("profile:sync", payload,
                     io.socket.client.Ack { args ->
                         if (continuation.isActive) continuation.resume(args.firstOrNull() as? JSONObject ?: JSONObject())
                     })
@@ -235,6 +263,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         if (socket !== current || generation != connectionGeneration || operation != sessionOperation) throw ProfileSyncFailure("Connection changed. Try again.")
         if (!response.optBoolean("ok")) throw ProfileSyncFailure(response.optString("error", "Profile was not accepted"))
         if (normalizedPlayerName(response.optString("displayName")) == null) throw ProfileSyncFailure("Invalid profile acknowledgement")
+        response.optString("accountToken").takeIf { it.isNotBlank() }?.let { profileStore.saveAccountToken(it) }
         return response
     }
 
@@ -717,6 +746,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                     phase = BattlePhase.RESULT,
                     winner = if (onlineResult.equals(info.role, true)) Fighter.PLAYER else Fighter.BOT
                 )
+                fetchProfileStats()
             }
         }
     }
@@ -780,6 +810,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                 mutableOnlineSubmissionStatus.value = value.optString("message", "")
                 mutableState.value = onlineBattleState(question, updatedInfo, hostHp, guestHp, BattlePhase.RESULT)
                     .copy(winner = if (winner.equals(info.role, true)) Fighter.PLAYER else Fighter.BOT)
+                fetchProfileStats()
             }
         }
     }

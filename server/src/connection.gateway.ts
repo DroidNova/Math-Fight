@@ -2,17 +2,19 @@ import { ConnectedSocket, MessageBody, SubscribeMessage, WebSocketGateway, OnGat
 import { OnApplicationShutdown } from '@nestjs/common';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { Socket } from 'socket.io';
+import { AccountService } from './account.service';
 
 type Role = 'host' | 'guest';
 type Difficulty = 'EASY' | 'STANDARD' | 'EXPERT';
 type Question = { matchId: string; questionId: number; left: number; operation: 'ADD' | 'SUBTRACT' | 'MULTIPLY' | 'DIVIDE'; right: number };
-type Match = { matchId: string; difficulty: Difficulty; hostName: string; guestName: string; question: Question; phase: 'answering' | 'resolving' | 'paused' | 'resuming' | 'result'; hostHp: number; guestHp: number; revision: number; attacker?: Role; winner?: Role; message?: string; timer?: NodeJS.Timeout; requests: Map<string, object>; received: Set<string> };
-type Player = { id: string; token: string; profileId?: string; displayName?: string; searchId?: string; socket?: Socket; roomCode?: string; deadline?: number; graceTimer?: NodeJS.Timeout };
+type Match = { matchId: string; difficulty: Difficulty; hostName: string; guestName: string; question: Question; phase: 'answering' | 'resolving' | 'paused' | 'resuming' | 'result'; hostHp: number; guestHp: number; revision: number; attacker?: Role; winner?: Role; message?: string; startedAt: Date; timer?: NodeJS.Timeout; requests: Map<string, object>; received: Set<string> };
+type Player = { id: string; token: string; profileId?: string; displayName?: string; accountId?: string; searchId?: string; socket?: Socket; roomCode?: string; deadline?: number; graceTimer?: NodeJS.Timeout };
 type Room = { code: string; difficulty: Difficulty; host: Player; guest?: Player; hostReady: boolean; guestReady: boolean; match?: Match };
 type SearchEntry = { player: Player; searchId: string; difficulty: Difficulty; joinedAt: number };
 
 @WebSocketGateway({ cors: true, pingInterval: 3_000, pingTimeout: 5_000 })
 export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconnect, OnApplicationShutdown {
+  constructor(private readonly accounts: AccountService) {}
   private readonly rooms = new Map<string, Room>();
   private readonly players = new Map<string, Player>();
   private readonly matchmakingQueue: SearchEntry[] = [];
@@ -85,7 +87,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   }
 
   @SubscribeMessage('profile:sync')
-  syncProfile(@ConnectedSocket() client: Socket, @MessageBody() body: { profileId?: unknown; displayName?: unknown }) {
+  async syncProfile(@ConnectedSocket() client: Socket, @MessageBody() body: { profileId?: unknown; displayName?: unknown; accountToken?: unknown }) {
     const player = this.playerFor(client);
     if (!player) return { ok: false, error: 'Connect again to start a session' };
     if (typeof body?.profileId !== 'string' || body.profileId.length !== 36 || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.profileId)) {
@@ -101,11 +103,25 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     if (room?.match && room.match.phase !== 'result' && (player.profileId !== profileId || player.displayName !== name)) {
       return { ok: false, error: 'Finish the active match before changing your profile' };
     }
-    // This ID is metadata only. Socket ownership and resume-token checks remain authoritative.
+    let account;
+    try {
+      account = await this.accounts.authenticate(profileId, name, typeof body.accountToken === 'string' ? body.accountToken : undefined);
+    } catch (error) {
+      return { ok: false, error: error instanceof Error ? error.message : 'Account authentication failed' };
+    }
     player.profileId = profileId;
     player.displayName = name;
+    player.accountId = account.player.id;
     if (room) this.emitState(room.code);
-    return { ok: true, displayName: name, room: room ? this.roomState(room, player) : undefined };
+    return { ok: true, displayName: name, accountToken: account.issuedToken, room: room ? this.roomState(room, player) : undefined };
+  }
+
+  @SubscribeMessage('profile:stats')
+  async profileStats(@ConnectedSocket() client: Socket) {
+    const player = this.playerFor(client);
+    if (!player?.accountId) return { ok: false, error: 'Profile is not registered' };
+    const stats = await this.accounts.stats(player.accountId);
+    return stats ? { ok: true, ...stats } : { ok: false, error: 'Statistics unavailable' };
   }
 
   private parseDifficulty(value: unknown): Difficulty | undefined {
@@ -386,7 +402,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   private startMatch(room: Room) {
     const matchId = randomUUID();
     const question = this.makeQuestion(matchId, 1, room.difficulty);
-    room.match = { matchId, difficulty: room.difficulty, hostName: room.host.displayName!, guestName: room.guest!.displayName!, question, phase: 'answering', hostHp: 100, guestHp: 100, revision: 1, requests: new Map(), received: new Set() };
+    room.match = { matchId, difficulty: room.difficulty, hostName: room.host.displayName!, guestName: room.guest!.displayName!, question, phase: 'answering', hostHp: 100, guestHp: 100, revision: 1, requests: new Map(), received: new Set(), startedAt: new Date() };
     this.emitState(room.code);
     const payload = { ...question, difficulty: room.match.difficulty, hostName: room.match.hostName, guestName: room.match.guestName, playerHp: 100, opponentHp: 100, revision: room.match.revision };
     this.broadcastMatch(room, 'match:start', payload);
@@ -403,6 +419,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     match.message = message;
     match.revision++;
     this.broadcastMatch(room, 'match:result', this.snapshot(match, room));
+    void this.accounts.recordMatch({ matchId: match.matchId, hostId: room.host.accountId, guestId: room.guest?.accountId, hostName: match.hostName, guestName: match.guestName, winnerId: attacker === 'host' ? room.host.accountId : room.guest?.accountId, difficulty: match.difficulty, finishReason: message ? 'forfeit' : 'normal', hostHp: match.hostHp, guestHp: match.guestHp, startedAt: match.startedAt }).catch(() => undefined);
     room.hostReady = false;
     room.guestReady = false;
     this.emitState(room.code);

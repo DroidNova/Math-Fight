@@ -42,6 +42,21 @@ fun ProfileScreen(state: ProfileUiState, onName: (String) -> Unit, onSave: () ->
                     Text(if (state.editing) "Profile" else "Choose your player name",
                         style = MaterialTheme.typography.headlineSmall)
                     if (state.editing) Text("Current name: ${state.displayName}", Modifier.padding(top = 12.dp))
+                    when {
+                        state.statsLoading -> Text("Loading statistics…", Modifier.padding(top = 16.dp))
+                        state.stats != null -> {
+                            val stats = state.stats
+                            Text("Matches played: ${stats.matchesPlayed}   Wins: ${stats.wins}   Losses: ${stats.losses}", Modifier.padding(top = 16.dp))
+                            Text("Win rate: ${(stats.winRate * 100).toInt()}%", Modifier.padding(top = 4.dp))
+                            if (stats.matches.isNotEmpty()) {
+                                Text("Recent matches", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 12.dp))
+                                stats.matches.forEach { match ->
+                                    Text("${match.result} vs ${match.opponentName} • ${match.difficulty.lowercase().replaceFirstChar { it.uppercase() }}${if (match.finishReason == "forfeit") " • forfeit" else ""}")
+                                }
+                            }
+                        }
+                        state.editing -> Text("Statistics unavailable while offline", Modifier.padding(top = 16.dp))
+                    }
                     OutlinedTextField(
                         value = state.nameInput, onValueChange = onName, label = { Text("Player name") },
                         singleLine = true, enabled = !state.saving, isError = state.error.isNotEmpty(),
