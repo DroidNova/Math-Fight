@@ -5,6 +5,8 @@ import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.core.keyframes
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -37,6 +39,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.droidnova.mathfight.game.BattlePhase
 import com.droidnova.mathfight.game.BattleState
@@ -48,6 +51,8 @@ import kotlinx.coroutines.launch
 
 @Composable
 fun MathFightApp(
+    displayName: String,
+    onProfile: () -> Unit,
     state: BattleState,
     isResumed: Boolean,
     impactToken: PhaseKey?,
@@ -81,14 +86,16 @@ fun MathFightApp(
     onLeaveRoom: () -> Unit,
     onReady: () -> Unit
 ) {
+    val localName = onlineMatch?.localName ?: displayName
+    val opponentName = onlineMatch?.opponentName ?: "Bot"
     BackHandler(enabled = state.phase != BattlePhase.HOME || room != null ||
         connectionStatus == BattleViewModel.ConnectionStatus.CONNECTED ||
         connectionStatus == BattleViewModel.ConnectionStatus.CONNECTING, onBack = onReturnHome)
     when (state.phase) {
         BattlePhase.HOME -> HomeScreen(onStart, settings, onSound, onVibration,
             debugConnection, serverUrl, connectionStatus, connectionMessage, onServerUrl, onConnect, onDisconnect,
-            roomCodeInput, room, roomError, onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom, onReady)
-        BattlePhase.RESULT -> ResultScreen(state.winner, onRestart, onlineMatch != null, onlineSubmissionStatus)
+            roomCodeInput, room, roomError, onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom, onReady, onProfile)
+        BattlePhase.RESULT -> ResultScreen(state.winner, onRestart, onlineMatch != null, onlineSubmissionStatus, localName, opponentName)
         else -> BattleScreen(
             state = state,
             isResumed = isResumed,
@@ -104,7 +111,9 @@ fun MathFightApp(
             ,online = onlineMatch != null, onlineAnswerLocked = onlineAnswerLocked,
             onlineSubmissionStatus = onlineSubmissionStatus,
             canRetry = onlineMatch != null && connectionStatus == BattleViewModel.ConnectionStatus.DISCONNECTED,
-            onRetry = onConnect
+            onRetry = onConnect,
+            localName = localName,
+            opponentName = opponentName
         )
     }
 }
@@ -117,14 +126,15 @@ private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
                        onServerUrl: (String) -> Unit, onConnect: () -> Unit, onDisconnect: () -> Unit,
                        roomCodeInput: String, room: RoomInfo?, roomError: String,
                        onRoomCode: (String) -> Unit, onCreateRoom: () -> Unit,
-                       onJoinRoom: () -> Unit, onLeaveRoom: () -> Unit, onReady: () -> Unit) {
+                       onJoinRoom: () -> Unit, onLeaveRoom: () -> Unit, onReady: () -> Unit, onProfile: () -> Unit) {
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(
-            modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
+            modifier = Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(24.dp),
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Text("Math Fight", style = MaterialTheme.typography.displaySmall)
+            TextButton(onClick = onProfile, enabled = room?.matchActive != true) { Text("Profile") }
             if (debugConnection) {
                 ConnectionCheckPanel(serverUrl, connectionStatus, connectionMessage,
                     onServerUrl, onConnect, onDisconnect, roomCodeInput, room, roomError,
@@ -145,7 +155,8 @@ private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
 }
 
 @Composable
-private fun ResultScreen(winner: Fighter?, onRestart: () -> Unit, online: Boolean = false, message: String = "") {
+private fun ResultScreen(winner: Fighter?, onRestart: () -> Unit, online: Boolean, message: String,
+                         localName: String, opponentName: String) {
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
@@ -156,6 +167,7 @@ private fun ResultScreen(winner: Fighter?, onRestart: () -> Unit, online: Boolea
                 if (winner == Fighter.PLAYER) "You win!" else "You lose!",
                 style = MaterialTheme.typography.displaySmall
             )
+            Text("$localName vs $opponentName", modifier = Modifier.padding(top = 12.dp), textAlign = TextAlign.Center)
             if (online && message.isNotBlank()) Text(message, modifier = Modifier.padding(top = 12.dp))
             Button(
                 onClick = onRestart,
@@ -184,7 +196,9 @@ private fun BattleScreen(
     onlineAnswerLocked: Boolean,
     onlineSubmissionStatus: String,
     canRetry: Boolean,
-    onRetry: () -> Unit
+    onRetry: () -> Unit,
+    localName: String,
+    opponentName: String
 ) {
     val controlsEnabled = isResumed && state.phase == BattlePhase.ANSWERING && (!online || !onlineAnswerLocked)
     Surface(modifier = Modifier.fillMaxSize()) {
@@ -192,7 +206,7 @@ private fun BattleScreen(
             modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(12.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            HealthRow(state, isResumed, online)
+            HealthRow(state, isResumed, localName, opponentName)
             FeedbackControls(settings, onSound, onVibration)
             FighterArena(
                 state = state,
@@ -295,7 +309,8 @@ private fun ConnectionCheckPanel(
                     modifier = Modifier.padding(top = 8.dp))
                 Text("Role: ${room.role}")
                 Text("Players: ${room.playerCount}/2")
-                Text("Host ready: ${if (room.hostReady) "Yes" else "No"} • Guest ready: ${if (room.guestReady) "Yes" else "No"}")
+                Text("Host: ${room.hostName} • ${if (room.hostReady) "Ready" else "Not ready"}")
+                Text("Guest: ${room.guestName.ifBlank { "Waiting…" }} • ${if (room.guestReady) "Ready" else "Not ready"}")
                 Text(if (room.playerCount == 2) "Both players connected" else "Waiting for opponent…")
                 if (!room.matchActive && room.playerCount == 2) {
                     val ownReady = if (room.role.equals("Host", true)) room.hostReady else room.guestReady
@@ -325,13 +340,13 @@ private fun FeedbackControls(settings: FeedbackSettings, onSound: (Boolean) -> U
 }
 
 @Composable
-private fun HealthRow(state: BattleState, isResumed: Boolean, online: Boolean) {
+private fun HealthRow(state: BattleState, isResumed: Boolean, localName: String, opponentName: String) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(16.dp)
     ) {
-        HealthBar("Player", state.playerHp, isResumed, Modifier.weight(1f))
-        HealthBar(if (online) "Opponent" else "Bot", state.opponentHp, isResumed, Modifier.weight(1f))
+        HealthBar(localName, state.playerHp, isResumed, Modifier.weight(1f))
+        HealthBar(opponentName, state.opponentHp, isResumed, Modifier.weight(1f))
     }
 }
 
@@ -342,7 +357,8 @@ private fun HealthBar(label: String, hp: Int, isResumed: Boolean, modifier: Modi
         if (isResumed) progress.animateTo(hp.toFloat(), tween(260)) else progress.snapTo(hp.toFloat())
     }
     Column(modifier) {
-        Text("$label HP: $hp", style = MaterialTheme.typography.labelLarge)
+        Text(label, style = MaterialTheme.typography.labelLarge, minLines = 2, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        Text("HP: $hp", style = MaterialTheme.typography.labelLarge)
         LinearProgressIndicator(
             progress = { progress.value / STARTING_HP },
             modifier = Modifier.fillMaxWidth().padding(top = 4.dp)

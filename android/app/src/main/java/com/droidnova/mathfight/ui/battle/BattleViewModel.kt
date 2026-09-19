@@ -5,6 +5,17 @@ import android.os.Handler
 import android.os.Looper
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.droidnova.mathfight.profile.LocalProfile
+import com.droidnova.mathfight.profile.ProfileStore
+import com.droidnova.mathfight.profile.ProfileUiState
+import com.droidnova.mathfight.profile.NAME_VALIDATION_MESSAGE
+import com.droidnova.mathfight.profile.normalizedPlayerName
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.withTimeout
+import kotlin.coroutines.resume
+import java.io.IOException
 import com.droidnova.mathfight.game.BattlePhase
 import com.droidnova.mathfight.game.BattleState
 import com.droidnova.mathfight.game.Fighter
@@ -45,12 +56,24 @@ data class RoomInfo(
     val playerCount: Int,
     val hostReady: Boolean = false,
     val guestReady: Boolean = false,
-    val matchActive: Boolean = false
+    val matchActive: Boolean = false,
+    val hostName: String = "",
+    val guestName: String = ""
 )
-data class OnlineMatchInfo(val matchId: String, val questionId: Long, val role: String)
+data class OnlineMatchInfo(val matchId: String, val questionId: Long, val role: String,
+                           val hostName: String, val guestName: String) {
+    val localName: String get() = if (role.equals("host", true)) hostName else guestName
+    val opponentName: String get() = if (role.equals("host", true)) guestName else hostName
+}
 private data class PendingAnswer(val requestId: String, val matchId: String, val questionId: Long)
+private class ProfileSyncFailure(message: String) : Exception(message)
 
-class BattleViewModel : ViewModel() {
+class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
+    private var localProfile: LocalProfile? = null
+    private val mutableProfile = MutableStateFlow(ProfileUiState())
+    val profile = mutableProfile.asStateFlow()
+    private var profileLoadJob: Job? = null
+    private var profileSaveJob: Job? = null
     private val mutableState = MutableStateFlow(BattleState())
     val state = mutableState.asStateFlow()
 
@@ -68,7 +91,7 @@ class BattleViewModel : ViewModel() {
     private var consumedImpact: PhaseKey? = null
 
     enum class ConnectionStatus { IDLE, CONNECTING, CONNECTED, DISCONNECTED, ERROR }
-    private val mutableServerUrl = MutableStateFlow("http://192.168.1.9:3000")
+    private val mutableServerUrl = MutableStateFlow("http://192.168.1.7:3000")
     val serverUrl = mutableServerUrl.asStateFlow()
     private val mutableConnectionStatus = MutableStateFlow(ConnectionStatus.IDLE)
     val connectionStatus = mutableConnectionStatus.asStateFlow()
@@ -113,6 +136,88 @@ class BattleViewModel : ViewModel() {
     private var lastAttackQuestion = 0L
     private var returnedMatchId: String? = null
 
+    fun loadProfile() {
+        if (profileLoadJob?.isActive == true) return
+        mutableProfile.value = profile.value.copy(loading = true, loadFailed = false, error = "")
+        profileLoadJob = viewModelScope.launch {
+            try {
+                val loaded = profileStore.load()
+                localProfile = loaded
+                mutableProfile.value = ProfileUiState(loading = false, displayName = loaded.displayName, nameInput = loaded.displayName)
+            } catch (_: IOException) {
+                // Never replace a stored identity with a default when storage cannot be read.
+                mutableProfile.value = profile.value.copy(loading = false, loadFailed = true, error = "Could not load your profile. Try again.")
+            }
+        }
+    }
+
+    fun openProfile() {
+        if (state.value.phase != BattlePhase.HOME || room.value?.matchActive == true || profile.value.loading) return
+        mutableProfile.value = profile.value.copy(editing = true, nameInput = profile.value.displayName, error = "")
+    }
+
+    fun closeProfile() {
+        if (!profile.value.saving) mutableProfile.value = profile.value.copy(editing = false, error = "")
+    }
+
+    fun setProfileName(value: String) {
+        if (!profile.value.saving) mutableProfile.value = profile.value.copy(nameInput = value, error = "")
+    }
+
+    fun saveProfile() {
+        val previous = localProfile ?: return
+        if (profile.value.saving || state.value.phase != BattlePhase.HOME || room.value?.matchActive == true) return
+        val name = normalizedPlayerName(profile.value.nameInput)
+        if (name == null) {
+            mutableProfile.value = profile.value.copy(error = NAME_VALIDATION_MESSAGE)
+            return
+        }
+        if (socket != null && !sessionReady) {
+            mutableProfile.value = profile.value.copy(error = "Wait for the connection, then save again.")
+            return
+        }
+        mutableProfile.value = profile.value.copy(saving = true, error = "")
+        profileSaveJob = viewModelScope.launch {
+            try {
+                val current = socket
+                val canonical = if (current?.connected() == true && sessionReady) {
+                    synchronizeProfile(current, LocalProfile(previous.id, name)).optString("displayName")
+                } else name
+                val saved = profileStore.saveName(canonical)
+                localProfile = saved
+                mutableProfile.value = profile.value.copy(displayName = saved.displayName, nameInput = saved.displayName, editing = false)
+            } catch (_: TimeoutCancellationException) {
+                mutableProfile.value = profile.value.copy(error = "Profile sync timed out. Try again.")
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (error: ProfileSyncFailure) {
+                mutableProfile.value = profile.value.copy(error = error.message.orEmpty())
+            } catch (_: IOException) {
+                mutableProfile.value = profile.value.copy(error = "Could not save your profile. Try again.")
+            } finally {
+                mutableProfile.value = profile.value.copy(saving = false)
+            }
+        }
+    }
+
+    private suspend fun synchronizeProfile(current: Socket, value: LocalProfile): JSONObject {
+        val generation = connectionGeneration
+        val operation = sessionOperation
+        if (socket !== current || !current.connected()) throw ProfileSyncFailure("Connection changed. Try again.")
+        val response = withTimeout(3_000) {
+            suspendCancellableCoroutine<JSONObject> { continuation ->
+                current.emit("profile:sync", JSONObject().put("profileId", value.id).put("displayName", value.displayName),
+                    io.socket.client.Ack { args ->
+                        if (continuation.isActive) continuation.resume(args.firstOrNull() as? JSONObject ?: JSONObject())
+                    })
+            }
+        }
+        if (socket !== current || generation != connectionGeneration || operation != sessionOperation) throw ProfileSyncFailure("Connection changed. Try again.")
+        if (!response.optBoolean("ok")) throw ProfileSyncFailure(response.optString("error", "Profile was not accepted"))
+        if (normalizedPlayerName(response.optString("displayName")) == null) throw ProfileSyncFailure("Invalid profile acknowledgement")
+        return response
+    }
+
     fun consumeImpact(token: PhaseKey): Boolean {
         if (!resumed.value || state.value.key != token || token.phase != BattlePhase.IMPACT ||
             consumedToken != token || consumedImpact == token) return false
@@ -145,6 +250,7 @@ class BattleViewModel : ViewModel() {
     }
 
     fun connect() {
+        if (profile.value.loading || profile.value.displayName.isBlank() || profile.value.saving) return
         if (socket != null || connectionStatus.value == ConnectionStatus.CONNECTING) return
         val url = serverUrl.value.trim().trimEnd('/')
         if (url.isEmpty()) {
@@ -383,7 +489,9 @@ class BattleViewModel : ViewModel() {
             value.optInt("playerCount", 1),
             value.optBoolean("hostReady"),
             value.optBoolean("guestReady"),
-            value.optBoolean("matchActive")
+            value.optBoolean("matchActive"),
+            value.optString("hostName"),
+            value.optString("guestName")
         )
         mutableRoomError.value = ""
     }
@@ -424,7 +532,9 @@ class BattleViewModel : ViewModel() {
         val role = roleForSocket() ?: return
         clearOnlineMatch()
         cancelBot()
-        val info = OnlineMatchInfo(value.optString("matchId"), value.optLong("questionId"), role)
+        mutableProfile.value = profile.value.copy(editing = false)
+        val info = OnlineMatchInfo(value.optString("matchId"), value.optLong("questionId"), role,
+            value.optString("hostName"), value.optString("guestName"))
         mutableOnlineMatch.value = info
         onlineRevision = value.optLong("revision", 1L)
         mutableOnlineAnswerLocked.value = false
@@ -516,7 +626,8 @@ class BattleViewModel : ViewModel() {
         if (revision <= onlineRevision) return
         val questionValue = value.optJSONObject("question") ?: return
         val questionId = value.optLong("questionId")
-        val updatedInfo = info.copy(questionId = questionId)
+        val updatedInfo = info.copy(questionId = questionId,
+            hostName = value.optString("hostName", info.hostName), guestName = value.optString("guestName", info.guestName))
         onlineRevision = revision
         mutableOnlineMatch.value = updatedInfo
         clearPendingAnswer()
@@ -713,43 +824,71 @@ class BattleViewModel : ViewModel() {
                 }
                 playerId = response.optString("playerId")
                 resumeToken = response.optString("resumeToken")
-                sessionReady = true
-                reconnectAttempt = 0
-                mutableConnectionStatus.value = ConnectionStatus.CONNECTED
-                mutableConnectionMessage.value = "Connected"
-                val restoredRoom = response.optJSONObject("room")
-                if (restoredRoom != null) updateRoom(restoredRoom) else clearRoomFromServer()
-                val snapshot = response.optJSONObject("snapshot")
-                if (snapshot != null && snapshot.optString("matchId") != returnedMatchId) {
-                    if (onlineMatch.value == null) {
-                        roleForSocket()?.let { role ->
-                            cancelBot()
-                            mutableOnlineMatch.value = OnlineMatchInfo(snapshot.optString("matchId"), snapshot.optLong("questionId"), role)
-                        }
-                    }
-                    applyOnlineSnapshot(snapshot)
-                    // Receipt may be repeated if the snapshot was already applied; the server deduplicates it.
-                    if (snapshot.optString("phase") == "resuming") acknowledgeFreshQuestion(snapshot)
-                } else if (onlineMatch.value != null && state.value.phase != BattlePhase.RESULT) {
-                    clearOnlineMatch()
-                    mutableState.value = BattleState(battleId = state.value.battleId + 1)
-                    mutableRoomError.value = "Match ended"
-                }
+                restoreSessionState(response)
                 acknowledgementJob = viewModelScope.launch {
-                    delay(3_000)
-                    if (socket === current && generation == connectionGeneration && operation == sessionOperation) {
-                        mutableConnectionMessage.value = "Server acknowledgement timed out"
-                    }
-                }
-                current.emit("connection:check", io.socket.client.Ack { checkArgs ->
-                    mainHandler.post {
-                        if (socket === current && generation == connectionGeneration && sessionReady && operation == sessionOperation) {
-                            acknowledgementJob?.cancel()
-                            mutableConnectionMessage.value = (checkArgs.firstOrNull() as? JSONObject)
-                                ?.optString("message", "Connected") ?: "Connected"
+                    try {
+                        profileSaveJob?.join()
+                        val saved = localProfile ?: throw ProfileSyncFailure("Set up your player profile first")
+                        synchronizeProfile(current, saved)
+                        if (socket !== current || generation != connectionGeneration || operation != sessionOperation) return@launch
+                        mutableConnectionStatus.value = ConnectionStatus.CONNECTED
+                        mutableConnectionMessage.value = "Connected"
+                        checkServerConnection(current, generation, operation)
+                    } catch (_: TimeoutCancellationException) {
+                        handleConnectionLoss(current, generation)
+                    } catch (cancelled: CancellationException) {
+                        throw cancelled
+                    } catch (error: ProfileSyncFailure) {
+                        if (socket === current && generation == connectionGeneration && operation == sessionOperation) {
+                            suspendOnlineMatch()
+                            disposeSocket(ConnectionStatus.ERROR)
+                            mutableConnectionMessage.value = error.message.orEmpty()
                         }
                     }
-                })
+                }
+            }
+        })
+    }
+
+    private fun restoreSessionState(response: JSONObject) {
+        // Restore immediately after token authentication so battle events are not dropped while profile sync is in flight.
+        sessionReady = true
+        reconnectAttempt = 0
+        val restoredRoom = response.optJSONObject("room")
+        if (restoredRoom != null) updateRoom(restoredRoom) else clearRoomFromServer()
+        val snapshot = response.optJSONObject("snapshot")
+        if (snapshot != null && snapshot.optString("matchId") != returnedMatchId) {
+            if (onlineMatch.value == null) {
+                roleForSocket()?.let { role ->
+                    cancelBot()
+                    mutableOnlineMatch.value = OnlineMatchInfo(snapshot.optString("matchId"), snapshot.optLong("questionId"), role,
+                        snapshot.optString("hostName"), snapshot.optString("guestName"))
+                }
+            }
+            applyOnlineSnapshot(snapshot)
+            // Receipt may be repeated if the snapshot was already applied; the server deduplicates it.
+            if (snapshot.optString("phase") == "resuming") acknowledgeFreshQuestion(snapshot)
+        } else if (onlineMatch.value != null && state.value.phase != BattlePhase.RESULT) {
+            clearOnlineMatch()
+            mutableState.value = BattleState(battleId = state.value.battleId + 1)
+            mutableRoomError.value = "Match ended"
+        }
+    }
+
+    private fun checkServerConnection(current: Socket, generation: Long, operation: Long) {
+        acknowledgementJob = viewModelScope.launch {
+            delay(3_000)
+            if (socket === current && generation == connectionGeneration && operation == sessionOperation) {
+                mutableConnectionMessage.value = "Server acknowledgement timed out"
+            }
+        }
+        current.emit("connection:check", io.socket.client.Ack { checkArgs ->
+            mainHandler.post {
+                if (socket === current && generation == connectionGeneration && sessionReady && operation == sessionOperation) {
+                    acknowledgementJob?.cancel()
+                    mutableConnectionMessage.value = (checkArgs.firstOrNull() as? JSONObject)
+                        ?.optString("message", "Connected") ?: "Connected"
+                }
             }
         })
     }
@@ -806,6 +945,7 @@ class BattleViewModel : ViewModel() {
     private var botDeadlineMs: Long? = null
 
     init {
+        loadProfile()
         viewModelScope.launch {
             combine(
                 mutableState.map { it.key }.distinctUntilChanged(),

@@ -17,6 +17,10 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.platform.LocalView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
+import com.droidnova.mathfight.profile.ProfileStore
+import com.droidnova.mathfight.profile.ProfileScreen
 import com.droidnova.mathfight.game.PhaseKey
 import com.droidnova.mathfight.ui.battle.CombatAudio
 import com.droidnova.mathfight.ui.battle.FeedbackKind
@@ -26,7 +30,9 @@ import com.droidnova.mathfight.ui.battle.MathFightApp
 import com.droidnova.mathfight.ui.theme.MathFightTheme
 
 class MainActivity : ComponentActivity() {
-    private val battleViewModel: BattleViewModel by viewModels()
+    private val battleViewModel: BattleViewModel by viewModels {
+        viewModelFactory { initializer { BattleViewModel(ProfileStore(applicationContext)) } }
+    }
     private lateinit var audio: CombatAudio
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -35,6 +41,7 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
         setContent {
             val state by battleViewModel.state.collectAsStateWithLifecycle()
+            val profile by battleViewModel.profile.collectAsStateWithLifecycle()
             val isResumed by battleViewModel.isResumed.collectAsStateWithLifecycle()
             val settings by battleViewModel.settings.collectAsStateWithLifecycle()
             val serverUrl by battleViewModel.serverUrl.collectAsStateWithLifecycle()
@@ -77,7 +84,13 @@ class MainActivity : ComponentActivity() {
                 }
             }
             MathFightTheme {
+                if (profile.loading || profile.loadFailed || profile.displayName.isBlank() || profile.editing) {
+                    ProfileScreen(profile, battleViewModel::setProfileName, battleViewModel::saveProfile,
+                        battleViewModel::closeProfile, battleViewModel::loadProfile)
+                } else {
                 MathFightApp(
+                    displayName = profile.displayName,
+                    onProfile = battleViewModel::openProfile,
                     state = state,
                     isResumed = isResumed,
                     impactToken = impactToken,
@@ -117,6 +130,7 @@ class MainActivity : ComponentActivity() {
                     onSubmit = battleViewModel::submit,
                     onReturnHome = { audio.stop(); battleViewModel.returnHome() }
                 )
+                }
             }
         }
     }
