@@ -5,8 +5,8 @@ import { Socket } from 'socket.io';
 
 type Role = 'host' | 'guest';
 type Question = { matchId: string; questionId: number; left: number; operation: 'ADD' | 'SUBTRACT' | 'MULTIPLY'; right: number };
-type Match = { matchId: string; question: Question; phase: 'answering' | 'resolving' | 'paused' | 'resuming' | 'result'; hostHp: number; guestHp: number; revision: number; attacker?: Role; winner?: Role; message?: string; timer?: NodeJS.Timeout; requests: Map<string, object>; received: Set<string> };
-type Player = { id: string; token: string; socket?: Socket; roomCode?: string; deadline?: number; graceTimer?: NodeJS.Timeout };
+type Match = { matchId: string; hostName: string; guestName: string; question: Question; phase: 'answering' | 'resolving' | 'paused' | 'resuming' | 'result'; hostHp: number; guestHp: number; revision: number; attacker?: Role; winner?: Role; message?: string; timer?: NodeJS.Timeout; requests: Map<string, object>; received: Set<string> };
+type Player = { id: string; token: string; profileId?: string; displayName?: string; socket?: Socket; roomCode?: string; deadline?: number; graceTimer?: NodeJS.Timeout };
 type Room = { code: string; host: Player; guest?: Player; hostReady: boolean; guestReady: boolean; match?: Match };
 
 @WebSocketGateway({ cors: true, pingInterval: 3_000, pingTimeout: 5_000 })
@@ -77,6 +77,30 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     return { ok: true };
   }
 
+  @SubscribeMessage('profile:sync')
+  syncProfile(@ConnectedSocket() client: Socket, @MessageBody() body: { profileId?: unknown; displayName?: unknown }) {
+    const player = this.playerFor(client);
+    if (!player) return { ok: false, error: 'Connect again to start a session' };
+    if (typeof body?.profileId !== 'string' || body.profileId.length !== 36 || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.profileId)) {
+      return { ok: false, error: 'Invalid profile ID: expected a UUID' };
+    }
+    // Only literal spaces are normalized: tabs, newlines, controls and symbols stay invalid.
+    const name = typeof body?.displayName === 'string' ? body.displayName.replace(/^ +| +$/g, '').replace(/ +/g, ' ') : '';
+    if (Array.from(name).length < 3 || Array.from(name).length > 16 || /[^\p{L}\p{N}_ ]/u.test(name)) {
+      return { ok: false, error: 'Use 3–16 letters or numbers, spaces, or underscore.' };
+    }
+    const profileId = body.profileId.toLowerCase();
+    const room = player.roomCode ? this.rooms.get(player.roomCode) : undefined;
+    if (room?.match && room.match.phase !== 'result' && (player.profileId !== profileId || player.displayName !== name)) {
+      return { ok: false, error: 'Finish the active match before changing your profile' };
+    }
+    // This ID is metadata only. Socket ownership and resume-token checks remain authoritative.
+    player.profileId = profileId;
+    player.displayName = name;
+    if (room) this.emitState(room.code);
+    return { ok: true, displayName: name, room: room ? this.roomState(room, player) : undefined };
+  }
+
   @SubscribeMessage('connection:check')
   connectionCheck(@ConnectedSocket() _client: Socket) {
     return { ok: true, message: 'Math Fight server ready' };
@@ -86,19 +110,21 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   createRoom(@ConnectedSocket() client: Socket) {
     const player = this.playerFor(client);
     if (!player) return { ok: false, error: 'Connect again to start a session' };
+    if (!player.displayName) return { ok: false, error: 'Set up your player profile first' };
     if (player.roomCode) return { ok: false, error: 'already in a room' };
     let code = '';
     do { code = this.generateCode(); } while (this.rooms.has(code));
     this.rooms.set(code, { code, host: player, hostReady: false, guestReady: false });
     player.roomCode = code;
     this.emitState(code);
-    return { ok: true, room: { code, role: 'host', playerCount: 1 } };
+    return { ok: true, room: this.roomState(this.rooms.get(code)!, player) };
   }
 
   @SubscribeMessage('room:join')
   joinRoom(@ConnectedSocket() client: Socket, @MessageBody() body: { code?: string }) {
     const player = this.playerFor(client);
     if (!player) return { ok: false, error: 'Connect again to start a session' };
+    if (!player.displayName) return { ok: false, error: 'Set up your player profile first' };
     if (player.roomCode) return { ok: false, error: 'already in a room' };
     const code = String(body?.code ?? '').trim().toUpperCase();
     if (!/^[A-Z0-9]{6}$/.test(code)) return { ok: false, error: 'invalid room code' };
@@ -108,7 +134,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     room.guest = player;
     player.roomCode = code;
     this.emitState(code);
-    return { ok: true, room: { code, role: 'guest', playerCount: 2 } };
+    return { ok: true, room: this.roomState(room, player) };
   }
 
   @SubscribeMessage('room:leave')
@@ -235,15 +261,16 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
 
   private roomState(room: Room, player: Player) {
     return { code: room.code, role: room.host === player ? 'host' : 'guest', playerCount: room.guest ? 2 : 1,
+      hostName: room.host.displayName, guestName: room.guest?.displayName,
       hostReady: room.hostReady, guestReady: room.guestReady, matchActive: Boolean(room.match && room.match.phase !== 'result') };
   }
 
   private startMatch(room: Room) {
     const matchId = randomUUID();
     const question = this.makeQuestion(matchId, 1);
-    room.match = { matchId, question, phase: 'answering', hostHp: 100, guestHp: 100, revision: 1, requests: new Map(), received: new Set() };
+    room.match = { matchId, hostName: room.host.displayName!, guestName: room.guest!.displayName!, question, phase: 'answering', hostHp: 100, guestHp: 100, revision: 1, requests: new Map(), received: new Set() };
     this.emitState(room.code);
-    const payload = { ...question, playerHp: 100, opponentHp: 100, revision: room.match.revision };
+    const payload = { ...question, hostName: room.match.hostName, guestName: room.match.guestName, playerHp: 100, opponentHp: 100, revision: room.match.revision };
     this.broadcastMatch(room, 'match:start', payload);
   }
 
@@ -266,6 +293,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   private snapshot(match: Match, room?: Room) {
     const deadlines = [room?.host.deadline, room?.guest?.deadline].filter((value): value is number => value !== undefined);
     return { matchId: match.matchId, questionId: match.question.questionId, phase: match.phase,
+      hostName: match.hostName, guestName: match.guestName,
       question: { left: match.question.left, operation: match.question.operation, right: match.question.right },
       playerHp: match.hostHp, opponentHp: match.guestHp, attacker: match.attacker, winner: match.winner, revision: match.revision,
       message: match.message, deadline: deadlines.length ? Math.min(...deadlines) : undefined, serverNow: Date.now() };
