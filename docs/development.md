@@ -63,3 +63,7 @@ Phone verification is pending.
 ## Milestone 5
 
 The local server keeps ephemeral two-player rooms with six-character uppercase codes. The debug Connection check can create, join, leave, and display host/guest lobby state; room membership is cleared on disconnect, Back, URL changes, and backgrounding. Start Battle remains the offline bot mode.
+
+## Milestone 6
+
+Two ready room members receive the same server-generated question. The server validates answers, locks each question, applies 20 damage once, broadcasts attack/KO data, advances questions after 500 ms, and retains the room for a rematch after readiness resets. The Android client only renders server state and reuses the existing combat presentation. Active matches end with an opponent-disconnected message when a socket leaves.

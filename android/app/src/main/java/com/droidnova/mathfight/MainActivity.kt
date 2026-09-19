@@ -43,6 +43,8 @@ class MainActivity : ComponentActivity() {
             val roomCodeInput by battleViewModel.roomCodeInput.collectAsStateWithLifecycle()
             val room by battleViewModel.room.collectAsStateWithLifecycle()
             val roomError by battleViewModel.roomError.collectAsStateWithLifecycle()
+            val onlineMatch by battleViewModel.onlineMatch.collectAsStateWithLifecycle()
+            val onlineAnswerLocked by battleViewModel.onlineAnswerLocked.collectAsStateWithLifecycle()
             val view = LocalView.current
             var impactToken by remember { mutableStateOf<PhaseKey?>(null) }
             LaunchedEffect(view) {
@@ -83,17 +85,23 @@ class MainActivity : ComponentActivity() {
                     roomCodeInput = roomCodeInput,
                     room = room,
                     roomError = roomError,
+                    onlineMatch = onlineMatch,
+                    onlineAnswerLocked = onlineAnswerLocked,
                     onRoomCode = battleViewModel::setRoomCodeInput,
                     onCreateRoom = battleViewModel::createRoom,
                     onJoinRoom = battleViewModel::joinRoom,
                     onLeaveRoom = battleViewModel::leaveRoom,
+                    onReady = battleViewModel::readyToggle,
                     onSound = { enabled ->
                         battleViewModel.setSound(enabled)
                         if (!enabled) audio.stop()
                     },
                     onVibration = battleViewModel::setVibration,
                     onStart = battleViewModel::startBattle,
-                    onRestart = { audio.stop(); battleViewModel.restartBattle() },
+                    onRestart = {
+                        audio.stop()
+                        if (onlineMatch != null) battleViewModel.leaveOnlineLobby() else battleViewModel.restartBattle()
+                    },
                     onDigit = battleViewModel::digit,
                     onBackspace = battleViewModel::backspace,
                     onClear = battleViewModel::clear,

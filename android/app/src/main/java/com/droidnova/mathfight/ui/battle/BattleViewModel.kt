@@ -9,6 +9,8 @@ import com.droidnova.mathfight.game.BattlePhase
 import com.droidnova.mathfight.game.BattleState
 import com.droidnova.mathfight.game.Fighter
 import com.droidnova.mathfight.game.PhaseKey
+import com.droidnova.mathfight.game.Question
+import com.droidnova.mathfight.game.Operation
 import com.droidnova.mathfight.game.advancePhase
 import com.droidnova.mathfight.game.claimQuestion
 import com.droidnova.mathfight.game.clearInput
@@ -36,7 +38,15 @@ import org.json.JSONObject
 data class FeedbackSettings(val sound: Boolean = true, val vibration: Boolean = true)
 enum class FeedbackKind { HIT, KO }
 data class CombatFeedback(val token: PhaseKey, val kind: FeedbackKind)
-data class RoomInfo(val code: String, val role: String, val playerCount: Int)
+data class RoomInfo(
+    val code: String,
+    val role: String,
+    val playerCount: Int,
+    val hostReady: Boolean = false,
+    val guestReady: Boolean = false,
+    val matchActive: Boolean = false
+)
+data class OnlineMatchInfo(val matchId: String, val questionId: Long, val role: String)
 
 class BattleViewModel : ViewModel() {
     private val mutableState = MutableStateFlow(BattleState())
@@ -78,6 +88,13 @@ class BattleViewModel : ViewModel() {
     val roomError = mutableRoomError.asStateFlow()
     private var roomOperationGeneration = 0L
     private var roomRequestPending = false
+    private val mutableOnlineMatch = MutableStateFlow<OnlineMatchInfo?>(null)
+    val onlineMatch = mutableOnlineMatch.asStateFlow()
+    private val mutableOnlineAnswerLocked = MutableStateFlow(false)
+    val onlineAnswerLocked = mutableOnlineAnswerLocked.asStateFlow()
+    private var onlineResolutionJob: Job? = null
+    private var onlineResultJob: Job? = null
+    private var onlineResult: String? = null
 
     fun consumeImpact(token: PhaseKey): Boolean {
         if (!resumed.value || state.value.key != token || token.phase != BattlePhase.IMPACT ||
@@ -88,6 +105,19 @@ class BattleViewModel : ViewModel() {
 
     fun setSound(enabled: Boolean) { mutableSettings.value = settings.value.copy(sound = enabled) }
     fun setVibration(enabled: Boolean) { mutableSettings.value = settings.value.copy(vibration = enabled) }
+
+    fun readyToggle() {
+        val current = socket ?: return setRoomError("Connect to the server first")
+        val currentRoom = room.value ?: return setRoomError("Join a room first")
+        val ready = if (currentRoom.role.equals("Host", true)) !currentRoom.hostReady else !currentRoom.guestReady
+        current.emit("room:ready", JSONObject().put("ready", ready), io.socket.client.Ack { args ->
+            mainHandler.post {
+                if (socket !== current || args.isEmpty() || args[0] !is JSONObject) return@post
+                val response = args[0] as JSONObject
+                if (!response.optBoolean("ok", false)) setRoomError(response.optString("error", "Ready request failed"))
+            }
+        })
+    }
 
     fun setServerUrl(value: String) {
         if (value == mutableServerUrl.value) return
@@ -153,6 +183,44 @@ class BattleViewModel : ViewModel() {
         })
     }
 
+    fun submitOnlineAnswer() {
+        val match = onlineMatch.value ?: return
+        if (mutableState.value.phase != BattlePhase.ANSWERING || mutableOnlineAnswerLocked.value || mutableState.value.input.isEmpty()) return
+        val current = socket ?: return
+        val answer = mutableState.value.input
+        mutableOnlineAnswerLocked.value = true
+        mutableState.value = mutableState.value.copy(input = "", wrongAnswer = false)
+        current.emit("match:answer", JSONObject()
+            .put("matchId", match.matchId)
+            .put("questionId", match.questionId)
+            .put("answer", answer), io.socket.client.Ack { args ->
+            mainHandler.post {
+                if (socket !== current || mutableOnlineMatch.value?.matchId != match.matchId) return@post
+                val response = args.firstOrNull() as? JSONObject ?: return@post
+                if (!response.optBoolean("ok", false) && response.optBoolean("wrong", false)) {
+                    mutableOnlineAnswerLocked.value = false
+                    mutableState.value = mutableState.value.copy(input = "", wrongAnswer = true)
+                } else if (!response.optBoolean("ok", false)) {
+                    mutableOnlineAnswerLocked.value = false
+                    mutableState.value = mutableState.value.copy(input = "", wrongAnswer = true)
+                }
+            }
+        })
+    }
+
+    fun leaveOnlineLobby() {
+        clearOnlineMatch()
+        mutableState.value = BattleState(phase = BattlePhase.HOME, battleId = mutableState.value.battleId + 1)
+    }
+
+    private fun clearOnlineMatch() {
+        onlineResolutionJob?.cancel()
+        onlineResultJob?.cancel()
+        mutableOnlineMatch.value = null
+        mutableOnlineAnswerLocked.value = false
+        onlineResult = null
+    }
+
     fun leaveRoom() {
         roomOperationGeneration++
         roomRequestPending = false
@@ -163,6 +231,10 @@ class BattleViewModel : ViewModel() {
         mutableRoom.value = null
         mutableRoomCodeInput.value = ""
         mutableRoomError.value = ""
+        clearOnlineMatch()
+        if (mutableState.value.phase != BattlePhase.HOME) {
+            mutableState.value = BattleState(phase = BattlePhase.HOME, battleId = mutableState.value.battleId + 1)
+        }
     }
 
     private fun setRoomError(message: String) { mutableRoomError.value = message }
@@ -182,7 +254,10 @@ class BattleViewModel : ViewModel() {
         mutableRoom.value = RoomInfo(
             value.optString("code"),
             value.optString("role").replaceFirstChar { it.uppercase() },
-            value.optInt("playerCount", 1)
+            value.optInt("playerCount", 1),
+            value.optBoolean("hostReady"),
+            value.optBoolean("guestReady"),
+            value.optBoolean("matchActive")
         )
         mutableRoomError.value = ""
     }
@@ -193,6 +268,87 @@ class BattleViewModel : ViewModel() {
         mutableRoom.value = null
         mutableRoomCodeInput.value = ""
         if (!message.isNullOrBlank()) mutableRoomError.value = message
+        if (mutableOnlineMatch.value != null) {
+            clearOnlineMatch()
+            mutableState.value = BattleState(phase = BattlePhase.HOME, battleId = mutableState.value.battleId + 1)
+        }
+    }
+
+    private fun roleForSocket(): String? = room.value?.role?.lowercase()
+
+    private fun onlineQuestion(value: JSONObject): Question {
+        val operation = when (value.optString("operation")) {
+            "SUBTRACT" -> Operation.SUBTRACT
+            "MULTIPLY" -> Operation.MULTIPLY
+            else -> Operation.ADD
+        }
+        return Question(value.optInt("left"), operation, value.optInt("right"))
+    }
+
+    private fun onlineBattleState(question: Question, info: OnlineMatchInfo, hostHp: Int, guestHp: Int, phase: BattlePhase, attacker: Fighter? = null): BattleState {
+        val localHp = if (info.role.equals("host", true)) hostHp else guestHp
+        val opponentHp = if (info.role.equals("host", true)) guestHp else hostHp
+        return BattleState(phase = phase, playerHp = localHp, opponentHp = opponentHp, question = question,
+            attacker = attacker, battleId = info.matchId.hashCode().toLong(), questionId = info.questionId)
+    }
+
+    private fun handleMatchStart(value: JSONObject) {
+        val role = roleForSocket() ?: return
+        val info = OnlineMatchInfo(value.optString("matchId"), value.optLong("questionId"), role)
+        mutableOnlineMatch.value = info
+        mutableOnlineAnswerLocked.value = false
+        onlineResult = null
+        mutableState.value = onlineBattleState(onlineQuestion(value), info, value.optInt("playerHp", 100), value.optInt("opponentHp", 100), BattlePhase.ANSWERING)
+    }
+
+    private fun handleMatchQuestion(value: JSONObject) {
+        val old = mutableOnlineMatch.value ?: return
+        if (value.optString("matchId") != old.matchId || value.optLong("questionId") <= old.questionId) return
+        val info = old.copy(questionId = value.optLong("questionId"))
+        mutableOnlineMatch.value = info
+        mutableOnlineAnswerLocked.value = false
+        mutableState.value = onlineBattleState(onlineQuestion(value), info, mutableState.value.playerHp, mutableState.value.opponentHp, BattlePhase.ANSWERING)
+    }
+
+    private fun handleMatchAttack(value: JSONObject) {
+        val info = mutableOnlineMatch.value ?: return
+        if (value.optString("matchId") != info.matchId || value.optLong("questionId") != info.questionId || mutableState.value.phase != BattlePhase.ANSWERING) return
+        mutableOnlineAnswerLocked.value = true
+        val attackerRole = value.optString("attacker")
+        val attacker = if (attackerRole.equals(info.role, true)) Fighter.PLAYER else Fighter.BOT
+        val question = mutableState.value.question ?: return
+        val hostHp = value.optInt("playerHp", 0)
+        val guestHp = value.optInt("opponentHp", 0)
+        mutableState.value = onlineBattleState(question, info, hostHp, guestHp, BattlePhase.WINDUP, attacker)
+        onlineResolutionJob?.cancel()
+        onlineResolutionJob = viewModelScope.launch {
+            delay(180)
+            if (mutableOnlineMatch.value != info) return@launch
+            mutableState.value = onlineBattleState(question, info, hostHp, guestHp, BattlePhase.IMPACT, attacker)
+            mutableFeedback.tryEmit(CombatFeedback(mutableState.value.key, FeedbackKind.HIT))
+            delay(320)
+            if (mutableOnlineMatch.value != info) return@launch
+            if (value.optBoolean("ko")) {
+                mutableState.value = onlineBattleState(question, info, hostHp, guestHp, BattlePhase.KO, attacker)
+                mutableFeedback.tryEmit(CombatFeedback(mutableState.value.key, FeedbackKind.KO))
+            }
+        }
+    }
+
+    private fun handleMatchResult(value: JSONObject) {
+        val info = mutableOnlineMatch.value ?: return
+        if (value.optString("matchId") != info.matchId) return
+        onlineResult = value.optString("winner")
+        onlineResultJob?.cancel()
+        onlineResultJob = viewModelScope.launch {
+            delay(600)
+            if (mutableOnlineMatch.value == info && onlineResult != null) {
+                mutableState.value = mutableState.value.copy(
+                    phase = BattlePhase.RESULT,
+                    winner = if (onlineResult.equals(info.role, true)) Fighter.PLAYER else Fighter.BOT
+                )
+            }
+        }
     }
 
     fun connectionPermissionDenied() {
@@ -243,6 +399,30 @@ class BattleViewModel : ViewModel() {
                 val message = if (args.isNotEmpty() && args[0] is JSONObject)
                     (args[0] as JSONObject).optString("message") else "Room closed"
                 clearRoomFromServer(message)
+            }
+        }
+        created.on("match:start") { args ->
+            mainHandler.post { if (generation == connectionGeneration && socket === created && args.firstOrNull() is JSONObject) handleMatchStart(args[0] as JSONObject) }
+        }
+        created.on("match:question") { args ->
+            mainHandler.post { if (generation == connectionGeneration && socket === created && args.firstOrNull() is JSONObject) handleMatchQuestion(args[0] as JSONObject) }
+        }
+        created.on("match:attack") { args ->
+            mainHandler.post { if (generation == connectionGeneration && socket === created && args.firstOrNull() is JSONObject) handleMatchAttack(args[0] as JSONObject) }
+        }
+        created.on("match:result") { args ->
+            mainHandler.post { if (generation == connectionGeneration && socket === created && args.firstOrNull() is JSONObject) handleMatchResult(args[0] as JSONObject) }
+        }
+        created.on("match:ended") { args ->
+            mainHandler.post {
+                if (generation != connectionGeneration || socket !== created) return@post
+                val message = if (args.firstOrNull() is JSONObject) (args[0] as JSONObject).optString("message") else "Opponent disconnected"
+                onlineResolutionJob?.cancel()
+                onlineResultJob?.cancel()
+                mutableOnlineMatch.value = null
+                mutableOnlineAnswerLocked.value = false
+                mutableState.value = BattleState(phase = BattlePhase.HOME, battleId = mutableState.value.battleId + 1)
+                mutableRoomError.value = message.ifBlank { "Opponent disconnected" }
             }
         }
         created.on(Socket.EVENT_CONNECT) {
@@ -339,7 +519,7 @@ class BattleViewModel : ViewModel() {
             ) { key, active -> key.takeIf { active } }
                 .distinctUntilChanged()
                 .collectLatest { key ->
-                    if (key == null) return@collectLatest
+                    if (key == null || mutableOnlineMatch.value != null) return@collectLatest
                     val duration = key.phase.durationMillis() ?: return@collectLatest
                     delay(duration)
                     if (resumed.value) updateState(advancePhase(mutableState.value, key))
@@ -419,11 +599,23 @@ class BattleViewModel : ViewModel() {
 
     fun startBattle() = edit { if (it.phase == BattlePhase.HOME) newBattle(it) else it }
     fun restartBattle() = edit { if (it.phase == BattlePhase.RESULT) newBattle(it) else it }
-    fun digit(value: Int) = edit { enterDigit(it, value) }
-    fun backspace() = edit(::eraseDigit)
-    fun clear() = edit(::clearInput)
-    fun submit() = edit(::submitAnswer)
-    fun returnHome() = edit { BattleState(battleId = it.battleId + 1) }
+    fun digit(value: Int) {
+        if (onlineMatch.value != null) mutableState.value = enterDigit(mutableState.value, value) else edit { enterDigit(it, value) }
+    }
+    fun backspace() {
+        if (onlineMatch.value != null) mutableState.value = eraseDigit(mutableState.value) else edit(::eraseDigit)
+    }
+    fun clear() {
+        if (onlineMatch.value != null) mutableState.value = clearInput(mutableState.value) else edit(::clearInput)
+    }
+    fun submit() {
+        if (onlineMatch.value != null) submitOnlineAnswer() else edit(::submitAnswer)
+    }
+    fun returnHome() {
+        if (onlineMatch.value != null) {
+            if (state.value.phase != BattlePhase.RESULT) leaveRoom() else leaveOnlineLobby()
+        } else edit { BattleState(battleId = it.battleId + 1) }
+    }
 
     override fun onCleared() {
         cancelBot()

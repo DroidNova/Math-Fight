@@ -72,17 +72,20 @@ fun MathFightApp(
     roomCodeInput: String,
     room: RoomInfo?,
     roomError: String,
+    onlineMatch: OnlineMatchInfo?,
+    onlineAnswerLocked: Boolean,
     onRoomCode: (String) -> Unit,
     onCreateRoom: () -> Unit,
     onJoinRoom: () -> Unit,
-    onLeaveRoom: () -> Unit
+    onLeaveRoom: () -> Unit,
+    onReady: () -> Unit
 ) {
     BackHandler(enabled = state.phase != BattlePhase.HOME, onBack = onReturnHome)
     when (state.phase) {
         BattlePhase.HOME -> HomeScreen(onStart, settings, onSound, onVibration,
             debugConnection, serverUrl, connectionStatus, connectionMessage, onServerUrl, onConnect, onDisconnect,
-            roomCodeInput, room, roomError, onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom)
-        BattlePhase.RESULT -> ResultScreen(state.winner, onRestart)
+            roomCodeInput, room, roomError, onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom, onReady)
+        BattlePhase.RESULT -> ResultScreen(state.winner, onRestart, onlineMatch != null)
         else -> BattleScreen(
             state = state,
             isResumed = isResumed,
@@ -95,6 +98,7 @@ fun MathFightApp(
             onBackspace = onBackspace,
             onClear = onClear,
             onSubmit = onSubmit
+            ,online = onlineMatch != null, onlineAnswerLocked = onlineAnswerLocked
         )
     }
 }
@@ -107,7 +111,7 @@ private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
                        onServerUrl: (String) -> Unit, onConnect: () -> Unit, onDisconnect: () -> Unit,
                        roomCodeInput: String, room: RoomInfo?, roomError: String,
                        onRoomCode: (String) -> Unit, onCreateRoom: () -> Unit,
-                       onJoinRoom: () -> Unit, onLeaveRoom: () -> Unit) {
+                       onJoinRoom: () -> Unit, onLeaveRoom: () -> Unit, onReady: () -> Unit) {
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
@@ -118,7 +122,7 @@ private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
             if (debugConnection) {
                 ConnectionCheckPanel(serverUrl, connectionStatus, connectionMessage,
                     onServerUrl, onConnect, onDisconnect, roomCodeInput, room, roomError,
-                    onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom)
+                    onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom, onReady)
             }
             Text(
                 "Solve. Strike. Win.",
@@ -135,7 +139,7 @@ private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
 }
 
 @Composable
-private fun ResultScreen(winner: Fighter?, onRestart: () -> Unit) {
+private fun ResultScreen(winner: Fighter?, onRestart: () -> Unit, online: Boolean = false) {
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
@@ -150,7 +154,7 @@ private fun ResultScreen(winner: Fighter?, onRestart: () -> Unit) {
                 onClick = onRestart,
                 modifier = Modifier.padding(top = 28.dp).heightIn(min = 48.dp)
             ) {
-                Text("Restart")
+                Text(if (online) "Return to Lobby" else "Restart")
             }
         }
     }
@@ -168,15 +172,17 @@ private fun BattleScreen(
     onDigit: (Int) -> Unit,
     onBackspace: () -> Unit,
     onClear: () -> Unit,
-    onSubmit: () -> Unit
+    onSubmit: () -> Unit,
+    online: Boolean,
+    onlineAnswerLocked: Boolean
 ) {
-    val controlsEnabled = isResumed && state.phase == BattlePhase.ANSWERING
+    val controlsEnabled = isResumed && state.phase == BattlePhase.ANSWERING && (!online || !onlineAnswerLocked)
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(12.dp),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            HealthRow(state, isResumed)
+            HealthRow(state, isResumed, online)
             FeedbackControls(settings, onSound, onVibration)
             FighterArena(
                 state = state,
@@ -227,7 +233,8 @@ private fun ConnectionCheckPanel(
     onRoomCode: (String) -> Unit,
     onCreateRoom: () -> Unit,
     onJoinRoom: () -> Unit,
-    onLeaveRoom: () -> Unit
+    onLeaveRoom: () -> Unit,
+    onReady: () -> Unit
 ) {
     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
         Text("Connection check", style = MaterialTheme.typography.titleMedium)
@@ -273,7 +280,12 @@ private fun ConnectionCheckPanel(
                     modifier = Modifier.padding(top = 8.dp))
                 Text("Role: ${room.role}")
                 Text("Players: ${room.playerCount}/2")
+                Text("Host ready: ${if (room.hostReady) "Yes" else "No"} • Guest ready: ${if (room.guestReady) "Yes" else "No"}")
                 Text(if (room.playerCount == 2) "Both players connected" else "Waiting for opponent…")
+                if (!room.matchActive && room.playerCount == 2) {
+                    val ownReady = if (room.role.equals("Host", true)) room.hostReady else room.guestReady
+                    Button(onClick = onReady) { Text(if (ownReady) "Cancel Ready" else "Ready") }
+                }
                 OutlinedButton(onClick = onLeaveRoom) { Text("Leave Room") }
             }
             if (roomError.isNotEmpty()) {
@@ -298,13 +310,13 @@ private fun FeedbackControls(settings: FeedbackSettings, onSound: (Boolean) -> U
 }
 
 @Composable
-private fun HealthRow(state: BattleState, isResumed: Boolean) {
+private fun HealthRow(state: BattleState, isResumed: Boolean, online: Boolean) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.spacedBy(16.dp)
     ) {
         HealthBar("Player", state.playerHp, isResumed, Modifier.weight(1f))
-        HealthBar("Bot", state.opponentHp, isResumed, Modifier.weight(1f))
+        HealthBar(if (online) "Opponent" else "Bot", state.opponentHp, isResumed, Modifier.weight(1f))
     }
 }
 
