@@ -65,6 +65,7 @@ data class OnlineMatchInfo(val matchId: String, val questionId: Long, val role: 
     val localName: String get() = if (role.equals("host", true)) hostName else guestName
     val opponentName: String get() = if (role.equals("host", true)) guestName else hostName
 }
+data class MatchSearchState(val active: Boolean = false, val searchId: String = "", val status: String = "idle", val opponentName: String = "", val error: String = "")
 private data class PendingAnswer(val requestId: String, val matchId: String, val questionId: Long)
 private class ProfileSyncFailure(message: String) : Exception(message)
 
@@ -116,6 +117,9 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     val room = mutableRoom.asStateFlow()
     private val mutableRoomError = MutableStateFlow("")
     val roomError = mutableRoomError.asStateFlow()
+    private val mutableSearch = MutableStateFlow(MatchSearchState())
+    val search = mutableSearch.asStateFlow()
+    private var completedSearchId: String? = null
     private var roomOperationGeneration = 0L
     private var roomRequestPending = false
     private val mutableOnlineMatch = MutableStateFlow<OnlineMatchInfo?>(null)
@@ -274,7 +278,67 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         mutableRoomError.value = ""
     }
 
+    fun findMatch() {
+        val current = socket
+        if (!sessionReady || current?.connected() != true) return setSearchError("Connect to the server first")
+        if (room.value != null || onlineMatch.value != null) return setSearchError("Leave the current room first")
+        if (search.value.active) return
+        completedSearchId = null
+        mutableSearch.value = MatchSearchState(active = true, status = "waiting")
+        current.emit("matchmaking:join", io.socket.client.Ack { args ->
+            mainHandler.post {
+                if (socket !== current || args.firstOrNull() !is JSONObject) return@post
+                val response = args[0] as JSONObject
+                if (!response.optBoolean("ok")) {
+                    mutableSearch.value = MatchSearchState(error = response.optString("error", "Matchmaking failed"))
+                } else {
+                    val id = response.optString("searchId")
+                    if (id.isNotBlank()) mutableSearch.value = search.value.copy(active = true, searchId = id, status = "waiting", error = "")
+                }
+            }
+        })
+    }
+
+    fun cancelMatch() {
+        val current = socket ?: return clearSearch()
+        val id = search.value.searchId
+        if (id.isBlank()) return clearSearch()
+        current.emit("matchmaking:cancel", JSONObject().put("searchId", id), io.socket.client.Ack { args ->
+            mainHandler.post {
+                if (socket !== current || search.value.searchId != id) return@post
+                clearSearch()
+            }
+        })
+    }
+
+    private fun setSearchError(message: String) {
+        mutableSearch.value = MatchSearchState(error = message)
+    }
+
+    private fun clearSearch() { mutableSearch.value = MatchSearchState() }
+
+    private fun handleSearchStatus(value: JSONObject) {
+        val id = value.optString("searchId")
+        if (id == completedSearchId || room.value != null) return
+        if (id.isBlank() || id != search.value.searchId && search.value.searchId.isNotBlank()) return
+        when (value.optString("status")) {
+            "waiting" -> mutableSearch.value = search.value.copy(active = true, searchId = id, status = "waiting")
+            "cancelled", "idle" -> clearSearch()
+        }
+    }
+
+    private fun handleMatched(value: JSONObject) {
+        val id = value.optString("searchId")
+        if (!search.value.active || (search.value.searchId.isNotBlank() && search.value.searchId != id)) return
+        val roomValue = value.optJSONObject("room") ?: return
+        completedSearchId = id
+        mutableSearch.value = search.value.copy(active = false, status = "matched", opponentName = value.optString("opponentName"))
+        updateRoom(roomValue)
+        clearSearch()
+    }
+
     fun createRoom() {
+        if (search.value.active) return setRoomError("Cancel the current search first")
         val current = socket
         if (!sessionReady || current?.connected() != true) return setRoomError("Connect to the server first")
         val operation = ++roomOperationGeneration
@@ -288,6 +352,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     }
 
     fun joinRoom() {
+        if (search.value.active) return setRoomError("Cancel the current search first")
         val code = roomCodeInput.value
         if (code.length != 6) return setRoomError("Enter a 6-character room code")
         val current = socket
@@ -432,6 +497,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         val sessionRequest = ++sessionOperation
         roomOperationGeneration++
         roomRequestPending = false
+        clearSearch()
         val current = socket
         val generation = connectionGeneration
         val keep = keepConnection && sessionReady && current?.connected() == true
@@ -502,6 +568,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         mutableRoom.value = null
         mutableRoomCodeInput.value = ""
         if (!message.isNullOrBlank()) mutableRoomError.value = message
+        if (mutableSearch.value.active) clearSearch()
         if (mutableOnlineMatch.value != null && onlineResult == null && state.value.phase != BattlePhase.RESULT) {
             clearOnlineMatch()
             mutableState.value = BattleState(phase = BattlePhase.HOME, battleId = mutableState.value.battleId + 1)
@@ -699,6 +766,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         if (!value) {
             if (wantsConnection) {
                 reconnectJob?.cancel()
+                clearSearch()
                 suspendOnlineMatch()
                 disposeSocket(ConnectionStatus.DISCONNECTED)
             }
@@ -728,8 +796,22 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         created.on("room:state") { args ->
             mainHandler.post {
                 if (generation != connectionGeneration || socket !== created || !sessionReady ||
-                    (!roomRequestPending && mutableRoom.value == null)) return@post
-                if (args.isNotEmpty() && args[0] is JSONObject) updateRoom(args[0] as JSONObject)
+                    (!roomRequestPending && mutableRoom.value == null && !search.value.active)) return@post
+                if (args.isNotEmpty() && args[0] is JSONObject) {
+                    updateRoom(args[0] as JSONObject)
+                    // Room state is authoritative after pairing; clear any late or filtered search event.
+                    if (search.value.active) clearSearch()
+                }
+            }
+        }
+        created.on("matchmaking:status") { args ->
+            mainHandler.post {
+                if (generation == connectionGeneration && socket === created && args.firstOrNull() is JSONObject) handleSearchStatus(args[0] as JSONObject)
+            }
+        }
+        created.on("matchmaking:matched") { args ->
+            mainHandler.post {
+                if (generation == connectionGeneration && socket === created && args.firstOrNull() is JSONObject) handleMatched(args[0] as JSONObject)
             }
         }
         created.on("room:closed") { args ->
@@ -895,6 +977,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
 
     private fun handleConnectionLoss(current: Socket, generation: Long) {
         if (socket !== current || generation != connectionGeneration) return
+        clearSearch()
         suspendOnlineMatch()
         disposeSocket(ConnectionStatus.DISCONNECTED)
         mutableConnectionMessage.value = "Reconnecting\u2026"

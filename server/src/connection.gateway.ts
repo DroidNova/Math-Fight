@@ -6,18 +6,24 @@ import { Socket } from 'socket.io';
 type Role = 'host' | 'guest';
 type Question = { matchId: string; questionId: number; left: number; operation: 'ADD' | 'SUBTRACT' | 'MULTIPLY'; right: number };
 type Match = { matchId: string; hostName: string; guestName: string; question: Question; phase: 'answering' | 'resolving' | 'paused' | 'resuming' | 'result'; hostHp: number; guestHp: number; revision: number; attacker?: Role; winner?: Role; message?: string; timer?: NodeJS.Timeout; requests: Map<string, object>; received: Set<string> };
-type Player = { id: string; token: string; profileId?: string; displayName?: string; socket?: Socket; roomCode?: string; deadline?: number; graceTimer?: NodeJS.Timeout };
+type Player = { id: string; token: string; profileId?: string; displayName?: string; searchId?: string; socket?: Socket; roomCode?: string; deadline?: number; graceTimer?: NodeJS.Timeout };
 type Room = { code: string; host: Player; guest?: Player; hostReady: boolean; guestReady: boolean; match?: Match };
+type SearchEntry = { player: Player; searchId: string; joinedAt: number };
 
 @WebSocketGateway({ cors: true, pingInterval: 3_000, pingTimeout: 5_000 })
 export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconnect, OnApplicationShutdown {
   private readonly rooms = new Map<string, Room>();
   private readonly players = new Map<string, Player>();
+  private readonly matchmakingQueue: SearchEntry[] = [];
 
   handleConnection(client: Socket) { console.log(`Socket connected: ${client.id}`); }
   handleDisconnect(client: Socket) {
     const player = this.playerFor(client);
-    if (player) this.connectionLost(player);
+    if (player) {
+      if (this.removeSearch(player)) {
+        player.socket = undefined;
+      } else this.connectionLost(player);
+    }
     console.log(`Socket disconnected: ${client.id}`);
   }
 
@@ -73,7 +79,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   @SubscribeMessage('session:leave')
   leaveSession(@ConnectedSocket() client: Socket) {
     const player = this.playerFor(client);
-    if (player) { this.leaveRoom(player); this.removePlayer(player); }
+    if (player) { this.removeSearch(player); this.leaveRoom(player); this.removePlayer(player); }
     return { ok: true };
   }
 
@@ -104,6 +110,91 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   @SubscribeMessage('connection:check')
   connectionCheck(@ConnectedSocket() _client: Socket) {
     return { ok: true, message: 'Math Fight server ready' };
+  }
+
+  @SubscribeMessage('matchmaking:join')
+  matchmakingJoin(@ConnectedSocket() client: Socket) {
+    const player = this.playerFor(client);
+    if (!player || !player.displayName) return { ok: false, error: 'Set up your player profile first' };
+    if (player.roomCode) return { ok: false, error: 'You are already in a room or match' };
+    const existing = this.matchmakingQueue.find(entry => entry.player === player);
+    if (existing) return { ok: true, status: 'waiting', searchId: existing.searchId };
+    const searchId = randomUUID();
+    player.searchId = searchId;
+    this.matchmakingQueue.push({ player, searchId, joinedAt: Date.now() });
+    this.emitSearchStatus(player, searchId, 'waiting');
+    this.pairSearchers();
+    return { ok: true, status: 'waiting', searchId };
+  }
+
+  @SubscribeMessage('matchmaking:cancel')
+  matchmakingCancel(@ConnectedSocket() client: Socket, @MessageBody() body: { searchId?: string }) {
+    const player = this.playerFor(client);
+    if (!player) return { ok: false, error: 'Connect again to start a session' };
+    const entry = this.matchmakingQueue.find(item => item.player === player && item.searchId === String(body?.searchId ?? ''));
+    if (!entry) return { ok: true, status: player.roomCode ? 'matched' : 'idle', searchId: body?.searchId };
+    this.removeSearch(player, entry.searchId);
+    this.emitSearchStatus(player, entry.searchId, 'cancelled');
+    return { ok: true, status: 'cancelled', searchId: entry.searchId };
+  }
+
+  @SubscribeMessage('matchmaking:status')
+  matchmakingStatus(@ConnectedSocket() client: Socket) {
+    const player = this.playerFor(client);
+    const entry = player ? this.matchmakingQueue.find(item => item.player === player) : undefined;
+    return { ok: Boolean(player), status: entry ? 'waiting' : player?.roomCode ? 'matched' : 'idle', searchId: entry?.searchId };
+  }
+
+  private emitSearchStatus(player: Player, searchId: string, status: string) {
+    player.socket?.emit('matchmaking:status', { searchId, status });
+  }
+
+  private removeSearch(player: Player, searchId?: string) {
+    const index = this.matchmakingQueue.findIndex(item => item.player === player && (!searchId || item.searchId === searchId));
+    if (index < 0) return false;
+    this.matchmakingQueue.splice(index, 1);
+    player.searchId = undefined;
+    return true;
+  }
+
+  private pairSearchers() {
+    this.discardInvalidSearchers();
+    while (this.matchmakingQueue.length >= 2) {
+      const first = this.matchmakingQueue.shift()!;
+      const second = this.matchmakingQueue.shift()!;
+      if (first.player === second.player || first.player.id === second.player.id) continue;
+      first.player.searchId = undefined;
+      second.player.searchId = undefined;
+      this.createMatchedRoom(first, second);
+    }
+  }
+
+  private discardInvalidSearchers() {
+    for (let i = this.matchmakingQueue.length - 1; i >= 0; i--) {
+      const entry = this.matchmakingQueue[i];
+      if (!entry.player.socket || !entry.player.displayName || entry.player.roomCode || entry.player.searchId !== entry.searchId) {
+        this.matchmakingQueue.splice(i, 1);
+      }
+    }
+  }
+
+  private createMatchedRoom(first: SearchEntry, second: SearchEntry) {
+    let host = first.player;
+    let guest = second.player;
+    if (Math.random() < 0.5) [host, guest] = [guest, host];
+    let code = '';
+    do { code = this.generateCode(); } while (this.rooms.has(code));
+    const room: Room = { code, host, guest, hostReady: false, guestReady: false };
+    this.rooms.set(code, room);
+    host.roomCode = code;
+    guest.roomCode = code;
+    const hostState = this.roomState(room, host);
+    const guestState = this.roomState(room, guest);
+    const hostSearchId = host === first.player ? first.searchId : second.searchId;
+    const guestSearchId = guest === first.player ? first.searchId : second.searchId;
+    host.socket?.emit('matchmaking:matched', { searchId: hostSearchId, opponentName: guest.displayName, role: 'host', room: hostState });
+    guest.socket?.emit('matchmaking:matched', { searchId: guestSearchId, opponentName: host.displayName, role: 'guest', room: guestState });
+    this.emitState(code);
   }
 
   @SubscribeMessage('room:create')

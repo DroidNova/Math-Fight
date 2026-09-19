@@ -53,6 +53,9 @@ import kotlinx.coroutines.launch
 fun MathFightApp(
     displayName: String,
     onProfile: () -> Unit,
+    search: MatchSearchState,
+    onFindMatch: () -> Unit,
+    onCancelMatch: () -> Unit,
     state: BattleState,
     isResumed: Boolean,
     impactToken: PhaseKey?,
@@ -88,13 +91,16 @@ fun MathFightApp(
 ) {
     val localName = onlineMatch?.localName ?: displayName
     val opponentName = onlineMatch?.opponentName ?: "Bot"
-    BackHandler(enabled = state.phase != BattlePhase.HOME || room != null ||
+    val searchingWithoutRoom = search.active && room == null
+    BackHandler(enabled = searchingWithoutRoom || state.phase != BattlePhase.HOME || room != null ||
         connectionStatus == BattleViewModel.ConnectionStatus.CONNECTED ||
-        connectionStatus == BattleViewModel.ConnectionStatus.CONNECTING, onBack = onReturnHome)
+        connectionStatus == BattleViewModel.ConnectionStatus.CONNECTING,
+        onBack = if (searchingWithoutRoom) onCancelMatch else onReturnHome)
     when (state.phase) {
-        BattlePhase.HOME -> HomeScreen(onStart, settings, onSound, onVibration,
+        BattlePhase.HOME -> if (searchingWithoutRoom) SearchScreen(displayName, search, onCancelMatch)
+        else HomeScreen(onStart, settings, onSound, onVibration,
             debugConnection, serverUrl, connectionStatus, connectionMessage, onServerUrl, onConnect, onDisconnect,
-            roomCodeInput, room, roomError, onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom, onReady, onProfile)
+            roomCodeInput, room, roomError, onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom, onReady, onProfile, onFindMatch)
         BattlePhase.RESULT -> ResultScreen(state.winner, onRestart, onlineMatch != null, onlineSubmissionStatus, localName, opponentName)
         else -> BattleScreen(
             state = state,
@@ -126,7 +132,8 @@ private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
                        onServerUrl: (String) -> Unit, onConnect: () -> Unit, onDisconnect: () -> Unit,
                        roomCodeInput: String, room: RoomInfo?, roomError: String,
                        onRoomCode: (String) -> Unit, onCreateRoom: () -> Unit,
-                       onJoinRoom: () -> Unit, onLeaveRoom: () -> Unit, onReady: () -> Unit, onProfile: () -> Unit) {
+                       onJoinRoom: () -> Unit, onLeaveRoom: () -> Unit, onReady: () -> Unit, onProfile: () -> Unit,
+                       onFindMatch: () -> Unit) {
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(24.dp),
@@ -148,6 +155,10 @@ private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
             )
             Button(onClick = onStart, modifier = Modifier.heightIn(min = 48.dp)) {
                 Text("Start Battle")
+            }
+            Button(onClick = onFindMatch, enabled = connectionStatus == BattleViewModel.ConnectionStatus.CONNECTED && room == null,
+                modifier = Modifier.padding(top = 8.dp).heightIn(min = 48.dp)) {
+                Text("Find Match")
             }
             FeedbackControls(settings, onSound, onVibration)
         }
@@ -244,6 +255,19 @@ private fun BattleScreen(
                 onSubmit = onSubmit,
                 modifier = Modifier.fillMaxWidth().weight(0.66f)
             )
+        }
+    }
+}
+
+@Composable
+private fun SearchScreen(displayName: String, search: MatchSearchState, onCancel: () -> Unit) {
+    Surface(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center) {
+            Text("Finding an opponent…", style = MaterialTheme.typography.headlineSmall)
+            Text(displayName, modifier = Modifier.padding(top = 12.dp))
+            if (search.error.isNotBlank()) Text(search.error, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(top = 12.dp))
+            OutlinedButton(onClick = onCancel, modifier = Modifier.padding(top = 24.dp)) { Text("Cancel Search") }
         }
     }
 }

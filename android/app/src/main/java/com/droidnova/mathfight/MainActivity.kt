@@ -50,6 +50,7 @@ class MainActivity : ComponentActivity() {
             val roomCodeInput by battleViewModel.roomCodeInput.collectAsStateWithLifecycle()
             val room by battleViewModel.room.collectAsStateWithLifecycle()
             val roomError by battleViewModel.roomError.collectAsStateWithLifecycle()
+            val search by battleViewModel.search.collectAsStateWithLifecycle()
             val onlineMatch by battleViewModel.onlineMatch.collectAsStateWithLifecycle()
             val onlineAnswerLocked by battleViewModel.onlineAnswerLocked.collectAsStateWithLifecycle()
             val onlineSubmissionStatus by battleViewModel.onlineSubmissionStatus.collectAsStateWithLifecycle()
@@ -91,6 +92,9 @@ class MainActivity : ComponentActivity() {
                 MathFightApp(
                     displayName = profile.displayName,
                     onProfile = battleViewModel::openProfile,
+                    search = search,
+                    onFindMatch = battleViewModel::findMatch,
+                    onCancelMatch = battleViewModel::cancelMatch,
                     state = state,
                     isResumed = isResumed,
                     impactToken = impactToken,
