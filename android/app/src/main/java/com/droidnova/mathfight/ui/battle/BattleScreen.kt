@@ -98,6 +98,7 @@ fun MathFightApp(
     onlineMatch: OnlineMatchInfo?,
     onlineAnswerLocked: Boolean,
     onlineSubmissionStatus: String,
+    onlineQuestionPrompt: String,
     onRoomCode: (String) -> Unit,
     onCreateRoom: () -> Unit,
     onJoinRoom: () -> Unit,
@@ -133,6 +134,7 @@ fun MathFightApp(
             onSubmit = onSubmit
             ,online = onlineMatch != null, onlineAnswerLocked = onlineAnswerLocked,
             onlineSubmissionStatus = onlineSubmissionStatus,
+            onlineQuestionPrompt = onlineQuestionPrompt,
             difficulty = onlineMatch?.difficulty ?: difficulty,
             canRetry = onlineMatch != null && connectionStatus == BattleViewModel.ConnectionStatus.DISCONNECTED,
             onRetry = onConnect,
@@ -233,6 +235,7 @@ private fun BattleScreen(
     online: Boolean,
     onlineAnswerLocked: Boolean,
     onlineSubmissionStatus: String,
+    onlineQuestionPrompt: String,
     difficulty: Difficulty,
     canRetry: Boolean,
     onRetry: () -> Unit,
@@ -256,9 +259,10 @@ private fun BattleScreen(
                 modifier = Modifier.fillMaxWidth().weight(0.34f)
             )
             Text(
-                text = state.question?.display.orEmpty(),
+                text = onlineQuestionPrompt.ifEmpty { state.question?.display.orEmpty() },
                 style = MaterialTheme.typography.headlineSmall,
-                fontWeight = FontWeight.Bold
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Center
             )
             Text(
                 text = state.input.ifEmpty { " " },

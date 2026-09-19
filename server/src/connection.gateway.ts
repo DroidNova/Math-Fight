@@ -8,7 +8,9 @@ import { progressionResult } from './progression';
 type Role = 'host' | 'guest';
 type Difficulty = 'EASY' | 'STANDARD' | 'EXPERT';
 type Question = { matchId: string; questionId: number; left: number; operation: 'ADD' | 'SUBTRACT' | 'MULTIPLY' | 'DIVIDE'; right: number };
-type Match = { matchId: string; difficulty: Difficulty; ranked: boolean; hostName: string; guestName: string; question: Question; phase: 'answering' | 'resolving' | 'paused' | 'resuming' | 'result'; hostHp: number; guestHp: number; revision: number; attacker?: Role; winner?: Role; message?: string; startedAt: Date; timer?: NodeJS.Timeout; requests: Map<string, object>; received: Set<string>; rating?: object; hostProgression?: ReturnType<typeof progressionResult>; guestProgression?: ReturnType<typeof progressionResult> };
+type MatchPhase = 'SCHEDULED' | 'ANSWERING' | 'RESOLVING' | 'PAUSED' | 'FINISHED';
+type ScheduleReason = 'FIRST' | 'NEXT' | 'RESUME';
+type Match = { matchId: string; difficulty: Difficulty; ranked: boolean; hostName: string; guestName: string; question: Question; phase: MatchPhase; opensAt?: number; scheduleReason?: ScheduleReason; requiresReceipts: boolean; hostHp: number; guestHp: number; revision: number; attacker?: Role; winner?: Role; message?: string; startedAt: Date; timer?: NodeJS.Timeout; requests: Map<string, object>; received: Set<string>; rating?: object; hostProgression?: ReturnType<typeof progressionResult>; guestProgression?: ReturnType<typeof progressionResult> };
 type Player = { id: string; token: string; profileId?: string; displayName?: string; accountId?: string; rating?: number; searchId?: string; socket?: Socket; roomCode?: string; deadline?: number; graceTimer?: NodeJS.Timeout };
 type Room = { code: string; difficulty: Difficulty; ranked: boolean; host: Player; guest?: Player; hostReady: boolean; guestReady: boolean; match?: Match };
 type SearchEntry = { player: Player; searchId: string; difficulty: Difficulty; joinedAt: number };
@@ -68,9 +70,9 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     player.socket = client;
     client.data.playerId = player.id;
     const room = player.roomCode ? this.rooms.get(player.roomCode) : undefined;
-    if (room?.match?.phase === 'paused') this.resumeMatch(room);
+    if (room?.match?.phase === 'PAUSED') this.resumeMatch(room);
     // Completed matches can be restored without replaying their presentation.
-    if (room?.match?.phase === 'result' || room?.match?.phase === 'paused') room.match.revision++;
+    if (room?.match?.phase === 'FINISHED' || room?.match?.phase === 'PAUSED') room.match.revision++;
     return this.sessionResponse(player);
   }
 
@@ -102,7 +104,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     }
     const profileId = body.profileId.toLowerCase();
     const room = player.roomCode ? this.rooms.get(player.roomCode) : undefined;
-    if (room?.match && room.match.phase !== 'result' && (player.profileId !== profileId || player.displayName !== name)) {
+    if (room?.match && room.match.phase !== 'FINISHED' && (player.profileId !== profileId || player.displayName !== name)) {
       return { ok: false, error: 'Finish the active match before changing your profile' };
     }
     let account;
@@ -143,6 +145,12 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   @SubscribeMessage('connection:check')
   connectionCheck(@ConnectedSocket() _client: Socket) {
     return { ok: true, message: 'Math Fight server ready' };
+  }
+
+  @SubscribeMessage('time:sync')
+  timeSync(@ConnectedSocket() client: Socket) {
+    if (!this.playerFor(client)) return { ok: false, error: 'Connect again to start a session' };
+    return { ok: true, serverTime: Date.now() };
   }
 
   @SubscribeMessage('matchmaking:join')
@@ -298,13 +306,13 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     const code = player?.roomCode;
     const room = code ? this.rooms.get(code) : undefined;
     if (!room || !player) return { ok: false, error: 'not in a room' };
-    if (room.match && room.match.phase !== 'result') return { ok: false, error: 'match already active' };
+    if (room.match && room.match.phase !== 'FINISHED') return { ok: false, error: 'match already active' };
     const ready = Boolean(body?.ready);
     if (room.host === player) room.hostReady = ready;
     else if (room.guest === player) room.guestReady = ready;
     else return { ok: false, error: 'not in a room' };
     this.emitState(room.code);
-    if (room.host.socket && room.guest?.socket && room.hostReady && room.guestReady && (!room.match || room.match.phase === 'result')) this.startMatch(room);
+    if (room.host.socket && room.guest?.socket && room.hostReady && room.guestReady && (!room.match || room.match.phase === 'FINISHED')) this.startMatch(room);
     return { ok: true, ready };
   }
 
@@ -315,7 +323,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     const difficulty = this.parseDifficulty(body?.difficulty);
     if (!room || !player || room.host !== player) return { ok: false, error: 'Only the host can change difficulty' };
     if (!difficulty) return { ok: false, error: 'Invalid difficulty' };
-    if (room.match && room.match.phase !== 'result') return { ok: false, error: 'Difficulty is locked during a match' };
+    if (room.match && room.match.phase !== 'FINISHED') return { ok: false, error: 'Difficulty is locked during a match' };
     room.difficulty = difficulty;
     room.hostReady = false;
     room.guestReady = false;
@@ -332,15 +340,31 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     const room = code ? this.rooms.get(code) : undefined;
     const match = room?.match;
     if (!room || !match || !player) return { ok: false, result: 'invalid', error: 'no active match', ...base };
-    if (body?.matchId !== match.matchId || body?.questionId !== match.question.questionId || match.phase === 'paused' || match.phase === 'resuming') {
-      return { ok: false, result: 'invalid', error: 'stale or paused question', ...base };
+    if (body?.matchId !== match.matchId || body?.questionId !== match.question.questionId) {
+      return { ok: false, result: 'invalid', error: 'stale question', ...base };
     }
     const requestKey = `${player.id}:${requestId}`;
     const previous = requestId ? match.requests.get(requestKey) : undefined;
     if (previous) return previous;
     const role = room.host === player ? 'host' : room.guest === player ? 'guest' : undefined;
-    if (!requestId || !role || match.phase !== 'answering' || body?.matchId !== match.matchId || body?.questionId !== match.question.questionId) {
-      return { ok: false, result: match.phase === 'resolving' ? 'already_resolved' : 'invalid', error: 'stale question', ...base };
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId) || !role) {
+      return { ok: false, result: 'invalid', error: 'invalid request', ...base };
+    }
+    if (match.phase === 'PAUSED' || match.phase === 'FINISHED') {
+      const response = { ok: false, result: 'invalid', error: match.phase === 'PAUSED' ? 'match paused' : 'match finished', ...base };
+      this.rememberRequest(match, requestKey, response);
+      return response;
+    }
+    if (match.phase === 'SCHEDULED' || match.opensAt === undefined || Date.now() < match.opensAt) {
+      const response = { ok: false, result: 'not_open', code: 'NOT_OPEN', error: 'Question is not open yet', opensAt: match.opensAt, ...base };
+      this.rememberRequest(match, requestKey, response);
+      return response;
+    }
+    if (match.phase !== 'ANSWERING') {
+      const result = match.phase === 'RESOLVING' ? 'already_resolved' : 'invalid';
+      const response = { ok: false, result, error: 'stale question', ...base };
+      this.rememberRequest(match, requestKey, response);
+      return response;
     }
     const rawAnswer = body.answer;
     const validInteger = typeof rawAnswer === 'number' ? Number.isInteger(rawAnswer) : typeof rawAnswer === 'string' && /^[+-]?\d+$/.test(rawAnswer.trim());
@@ -353,7 +377,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     }
     const accepted = { ok: true, result: 'correct', ...base };
     this.rememberRequest(match, requestKey, accepted);
-    match.phase = 'resolving';
+    match.phase = 'RESOLVING';
     match.attacker = role;
     match.revision++;
     if (role === 'host') match.guestHp = Math.max(0, match.guestHp - 20);
@@ -363,14 +387,10 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     const questionId = match.question.questionId;
     match.timer = setTimeout(() => {
       const current = this.rooms.get(room.code);
-      if (current !== room || current.match !== match || match.phase !== 'resolving' || match.question.questionId !== questionId) return;
+      if (current !== room || current.match !== match || match.phase !== 'RESOLVING' || match.question.questionId !== questionId) return;
       if (ko) this.finishMatch(room, role);
       else {
-        match.question = this.makeQuestion(match.matchId, match.question.questionId + 1, match.difficulty, match.question);
-        match.phase = 'answering';
-        match.attacker = undefined;
-        match.revision++;
-        this.broadcastMatch(room, 'match:question', { ...match.question, difficulty: match.difficulty, playerHp: match.hostHp, opponentHp: match.guestHp, revision: match.revision });
+        this.scheduleQuestion(room, 1_500, 'NEXT', 'match:question');
       }
     }, 500);
     return accepted;
@@ -393,7 +413,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     player.deadline = undefined;
     const room = this.rooms.get(code);
     if (!room) return code;
-    if (room.match && room.match.phase !== 'result') {
+    if (room.match && room.match.phase !== 'FINISHED') {
       const winner = room.match.hostHp === 0 ? 'guest' : room.match.guestHp === 0 ? 'host' : room.host === player ? 'guest' : 'host';
       this.finishMatch(room, winner, 'Opponent disconnected');
     }
@@ -429,25 +449,72 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     return { code: room.code, role: room.host === player ? 'host' : 'guest', playerCount: room.guest ? 2 : 1,
       difficulty: room.difficulty, ranked: room.ranked, hostName: room.host.displayName, guestName: room.guest?.displayName,
       hostRating: room.host.rating ?? 1000, guestRating: room.guest?.rating, hostTier: this.tier(room.host.rating ?? 1000), guestTier: room.guest ? this.tier(room.guest.rating ?? 1000) : undefined,
-      hostReady: room.hostReady, guestReady: room.guestReady, matchActive: Boolean(room.match && room.match.phase !== 'result') };
+      hostReady: room.hostReady, guestReady: room.guestReady, matchActive: Boolean(room.match && room.match.phase !== 'FINISHED') };
   }
 
   private startMatch(room: Room) {
     const matchId = randomUUID();
     const question = this.makeQuestion(matchId, 1, room.difficulty);
-    room.match = { matchId, difficulty: room.difficulty, ranked: room.ranked, hostName: room.host.displayName!, guestName: room.guest!.displayName!, question, phase: 'answering', hostHp: 100, guestHp: 100, revision: 1, requests: new Map(), received: new Set(), startedAt: new Date() };
+    room.match = { matchId, difficulty: room.difficulty, ranked: room.ranked, hostName: room.host.displayName!, guestName: room.guest!.displayName!, question, phase: 'SCHEDULED', requiresReceipts: false, hostHp: 100, guestHp: 100, revision: 0, requests: new Map(), received: new Set(), startedAt: new Date() };
     this.emitState(room.code);
-    const payload = { ...question, difficulty: room.match.difficulty, ranked: room.match.ranked, matchType: room.match.ranked ? 'RANKED' : 'UNRANKED', hostName: room.match.hostName, guestName: room.match.guestName, playerHp: 100, opponentHp: 100, revision: room.match.revision };
-    this.broadcastMatch(room, 'match:start', payload);
+    this.scheduleQuestion(room, 3_000, 'FIRST', 'match:start', question);
+  }
+
+  private scheduleQuestion(room: Room, delayMs: number, reason: ScheduleReason, event: string, prepared?: Question) {
+    const match = room.match;
+    if (!match) return;
+    clearTimeout(match.timer);
+    const previous = match.question;
+    match.question = prepared ?? this.makeQuestion(match.matchId, previous.questionId + 1, match.difficulty, previous);
+    match.phase = 'SCHEDULED';
+    match.opensAt = Date.now() + delayMs;
+    match.scheduleReason = reason;
+    match.requiresReceipts = reason === 'RESUME';
+    match.attacker = undefined;
+    match.requests.clear();
+    match.received.clear();
+    match.revision++;
+    const scheduledRevision = match.revision;
+    const payload = { ...match.question, difficulty: match.difficulty, ranked: match.ranked,
+      matchType: match.ranked ? 'RANKED' : 'UNRANKED', hostName: match.hostName, guestName: match.guestName,
+      playerHp: match.hostHp, opponentHp: match.guestHp, phase: match.phase, opensAt: match.opensAt,
+      scheduleReason: reason, revision: match.revision };
+    this.broadcastMatch(room, event, event === 'match:resumed' ? this.snapshot(match, room) : payload);
+    const roomCode = room.code;
+    const matchId = match.matchId;
+    const questionId = match.question.questionId;
+    match.timer = setTimeout(() => {
+      const current = this.rooms.get(roomCode);
+      if (current !== room || current.match !== match || match.matchId !== matchId || match.question.questionId !== questionId ||
+          match.revision !== scheduledRevision || match.phase !== 'SCHEDULED') return;
+      this.openScheduledQuestion(room, scheduledRevision);
+    }, Math.max(0, match.opensAt - Date.now()) + 1);
+  }
+
+  private openScheduledQuestion(room: Room, scheduledRevision: number) {
+    const match = room.match;
+    if (!match || match.phase !== 'SCHEDULED' || match.revision !== scheduledRevision ||
+        match.opensAt === undefined || Date.now() < match.opensAt) return;
+    if (match.requiresReceipts && (!room.host.socket || !room.guest?.socket ||
+        !match.received.has(room.host.id) || !match.received.has(room.guest.id))) return;
+    clearTimeout(match.timer);
+    match.timer = undefined;
+    match.phase = 'ANSWERING';
+    match.requiresReceipts = false;
+    match.revision++;
+    this.broadcastMatch(room, 'match:snapshot', this.snapshot(match, room));
   }
 
   private async finishMatch(room: Room, attacker: Role, message?: string) {
     const match = room.match;
-    if (!match || match.phase === 'result') return;
+    if (!match || match.phase === 'FINISHED') return;
     clearTimeout(match.timer);
     match.requests.clear();
     match.received.clear();
-    match.phase = 'result';
+    match.phase = 'FINISHED';
+    match.opensAt = undefined;
+    match.scheduleReason = undefined;
+    match.requiresReceipts = false;
     match.winner = attacker;
     match.message = message;
     match.revision++;
@@ -482,7 +549,8 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
       question: { left: match.question.left, operation: match.question.operation, right: match.question.right },
       playerHp: match.hostHp, opponentHp: match.guestHp, attacker: match.attacker, winner: match.winner, revision: match.revision,
       rating: match.rating, progression: role === 'host' ? match.hostProgression : role === 'guest' ? match.guestProgression : undefined,
-      message: match.message, ranked: match.ranked, matchType: match.ranked ? 'RANKED' : 'UNRANKED', deadline: deadlines.length ? Math.min(...deadlines) : undefined, serverNow: Date.now() };
+      message: match.message, ranked: match.ranked, matchType: match.ranked ? 'RANKED' : 'UNRANKED', opensAt: match.opensAt ?? null,
+      scheduleReason: match.scheduleReason, deadline: deadlines.length ? Math.min(...deadlines) : undefined, serverNow: Date.now() };
   }
 
   private broadcastMatch(room: Room, event: string, payload: object) {
@@ -507,16 +575,20 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
       return;
     }
     clearTimeout(match.timer);
+    match.timer = undefined;
     match.requests.clear();
     match.received.clear();
     this.startGrace(player);
-    if (match.phase === 'result') return;
+    if (match.phase === 'FINISHED') return;
     // Damage is committed before broadcasting an attack. A lethal hit cannot be undone by loss.
     if (match.hostHp === 0 || match.guestHp === 0) {
       this.finishMatch(room, match.hostHp === 0 ? 'guest' : 'host');
       return;
     }
-    match.phase = 'paused';
+    match.phase = 'PAUSED';
+    match.opensAt = undefined;
+    match.scheduleReason = undefined;
+    match.requiresReceipts = false;
     match.attacker = undefined;
     match.revision++;
     this.broadcastMatch(room, 'match:paused', this.snapshot(match, room));
@@ -558,14 +630,8 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
 
   private resumeMatch(room: Room) {
     const match = room.match;
-    if (!match || match.phase !== 'paused' || !room.host.socket || !room.guest?.socket) return;
-    match.question = this.makeQuestion(match.matchId, match.question.questionId + 1, match.difficulty, match.question);
-    match.phase = 'resuming';
-    match.attacker = undefined;
-    match.requests.clear();
-    match.received.clear();
-    match.revision++;
-    this.broadcastMatch(room, 'match:resumed', this.snapshot(match, room));
+    if (!match || match.phase !== 'PAUSED' || !room.host.socket || !room.guest?.socket) return;
+    this.scheduleQuestion(room, 1_500, 'RESUME', 'match:resumed');
   }
 
   // A fresh question is kept locked until both phones have received it.
@@ -574,13 +640,12 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     const player = this.playerFor(client);
     const room = player?.roomCode ? this.rooms.get(player.roomCode) : undefined;
     const match = room?.match;
-    if (!player || !room || !match || match.phase !== 'resuming' || body?.matchId !== match.matchId ||
+    if (!player || !room || !match || match.phase !== 'SCHEDULED' || match.scheduleReason !== 'RESUME' ||
+        body?.matchId !== match.matchId ||
         body?.questionId !== match.question.questionId || body?.revision !== match.revision) return { ok: false };
     match.received.add(player.id);
     if (room.host.socket && room.guest?.socket && match.received.has(room.host.id) && match.received.has(room.guest.id)) {
-      match.phase = 'answering';
-      match.revision++;
-      this.broadcastMatch(room, 'match:snapshot', this.snapshot(match, room));
+      this.openScheduledQuestion(room, match.revision);
     }
     return { ok: true };
   }
