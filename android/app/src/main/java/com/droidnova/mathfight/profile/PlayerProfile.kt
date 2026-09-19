@@ -59,8 +59,8 @@ class ProfileStore(context: Context) {
     suspend fun saveAccountToken(token: String) { store.edit { it[accountTokenKey] = token } }
 }
 
-data class ProfileMatchStat(val result: String, val opponentName: String, val difficulty: String, val finishReason: String)
-data class ProfileStats(val matchesPlayed: Int, val wins: Int, val losses: Int, val winRate: Double, val matches: List<ProfileMatchStat>)
+data class ProfileMatchStat(val result: String, val opponentName: String, val difficulty: String, val finishReason: String, val matchType: String = "UNRANKED", val ratingChange: Int? = null)
+data class ProfileStats(val matchesPlayed: Int, val wins: Int, val losses: Int, val winRate: Double, val matches: List<ProfileMatchStat>, val rating: Int = 1000, val tier: String = "Silver", val leaderboardPosition: Int = 0)
 
 data class ProfileUiState(
     val loading: Boolean = true,

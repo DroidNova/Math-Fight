@@ -60,14 +60,24 @@ data class RoomInfo(
     val matchActive: Boolean = false,
     val hostName: String = "",
     val guestName: String = "",
-    val difficulty: Difficulty = Difficulty.STANDARD
+    val difficulty: Difficulty = Difficulty.STANDARD,
+    val ranked: Boolean = false,
+    val hostRating: Int = 1000,
+    val guestRating: Int? = null,
+    val hostTier: String = "Silver",
+    val guestTier: String? = null
 )
 data class OnlineMatchInfo(val matchId: String, val questionId: Long, val role: String,
-                           val hostName: String, val guestName: String, val difficulty: Difficulty) {
+                           val hostName: String, val guestName: String, val difficulty: Difficulty,
+                           val ranked: Boolean = false, val hostRating: Int = 1000, val guestRating: Int = 1000,
+                           val hostTier: String = "Silver", val guestTier: String = "Silver") {
     val localName: String get() = if (role.equals("host", true)) hostName else guestName
     val opponentName: String get() = if (role.equals("host", true)) guestName else hostName
 }
 data class MatchSearchState(val active: Boolean = false, val searchId: String = "", val status: String = "idle", val opponentName: String = "", val difficulty: Difficulty = Difficulty.STANDARD, val error: String = "")
+data class LeaderboardRow(val position: Int, val displayName: String, val rating: Int, val tier: String, val wins: Int, val losses: Int, val current: Boolean)
+data class LeaderboardState(val loading: Boolean = false, val connected: Boolean = false, val error: String = "", val rows: List<LeaderboardRow> = emptyList(), val currentPosition: Int = 0)
+data class RankedResult(val ranked: Boolean = false, val available: Boolean = false, val before: Int = 1000, val delta: Int = 0, val after: Int = 1000, val tier: String = "Silver")
 private data class PendingAnswer(val requestId: String, val matchId: String, val questionId: Long)
 private class ProfileSyncFailure(message: String) : Exception(message)
 
@@ -77,6 +87,12 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     val profile = mutableProfile.asStateFlow()
     private var profileLoadJob: Job? = null
     private var profileSaveJob: Job? = null
+    private val mutableLeaderboard = MutableStateFlow(LeaderboardState())
+    val leaderboard = mutableLeaderboard.asStateFlow()
+    private val mutableLeaderboardOpen = MutableStateFlow(false)
+    val leaderboardOpen = mutableLeaderboardOpen.asStateFlow()
+    private val mutableRankedResult = MutableStateFlow(RankedResult())
+    val rankedResult = mutableRankedResult.asStateFlow()
     private val mutableDifficulty = MutableStateFlow(Difficulty.STANDARD)
     val difficulty = mutableDifficulty.asStateFlow()
     private val mutableState = MutableStateFlow(BattleState())
@@ -166,6 +182,29 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         fetchProfileStats()
     }
 
+    fun openLeaderboard() {
+        if (state.value.phase != BattlePhase.HOME || room.value?.matchActive == true) return
+        mutableLeaderboardOpen.value = true
+        fetchLeaderboard()
+    }
+
+    fun closeLeaderboard() { mutableLeaderboardOpen.value = false }
+
+    private fun fetchLeaderboard() {
+        val current = socket
+        if (current?.connected() != true || !sessionReady) { mutableLeaderboard.value = LeaderboardState(connected = false, error = "Connect to the server to view the leaderboard"); return }
+        mutableLeaderboard.value = LeaderboardState(loading = true, connected = true)
+        current.emit("leaderboard:get", io.socket.client.Ack { args ->
+            mainHandler.post {
+                val response = args.firstOrNull() as? JSONObject
+                if (socket !== current || response?.optBoolean("ok") != true) { mutableLeaderboard.value = LeaderboardState(connected = true, error = response?.optString("error", "Leaderboard unavailable") ?: "Leaderboard unavailable"); return@post }
+                val rows = mutableListOf<LeaderboardRow>(); val values = response.optJSONArray("players")
+                for (index in 0 until (values?.length() ?: 0)) { val row = values?.optJSONObject(index) ?: continue; rows += LeaderboardRow(row.optInt("position"), row.optString("displayName"), row.optInt("rating", 1000), row.optString("tier", "Silver"), row.optInt("wins"), row.optInt("losses"), row.optBoolean("current")) }
+                mutableLeaderboard.value = LeaderboardState(connected = true, rows = rows, currentPosition = response.optInt("currentPosition"))
+            }
+        })
+    }
+
     fun closeProfile() {
         if (!profile.value.saving) mutableProfile.value = profile.value.copy(editing = false, error = "")
     }
@@ -238,9 +277,9 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                 val rows = response.optJSONArray("matches")
                 for (index in 0 until (rows?.length() ?: 0)) {
                     val row = rows?.optJSONObject(index) ?: continue
-                    recent += com.droidnova.mathfight.profile.ProfileMatchStat(row.optString("result"), row.optString("opponentName"), row.optString("difficulty"), row.optString("finishReason"))
+                    recent += com.droidnova.mathfight.profile.ProfileMatchStat(row.optString("result"), row.optString("opponentName"), row.optString("difficulty"), row.optString("finishReason"), row.optString("matchType", "UNRANKED"), if (row.isNull("ratingChange")) null else row.optInt("ratingChange"))
                 }
-                mutableProfile.value = profile.value.copy(statsLoading = false, stats = com.droidnova.mathfight.profile.ProfileStats(response.optInt("matchesPlayed"), response.optInt("wins"), response.optInt("losses"), response.optDouble("winRate"), recent))
+                mutableProfile.value = profile.value.copy(statsLoading = false, stats = com.droidnova.mathfight.profile.ProfileStats(response.optInt("matchesPlayed"), response.optInt("wins"), response.optInt("losses"), response.optDouble("winRate"), recent, response.optInt("rating", 1000), response.optString("tier", "Silver"), response.optInt("leaderboardPosition")))
             }
         })
     }
@@ -483,8 +522,28 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
 
     fun leaveOnlineLobby() {
         returnedMatchId = onlineMatch.value?.matchId
+        if (room.value?.ranked == true) {
+            socket?.emit("room:leave")
+            mutableRoom.value = null
+        }
         clearOnlineMatch()
         mutableState.value = BattleState(phase = BattlePhase.HOME, battleId = mutableState.value.battleId + 1)
+    }
+
+    fun findNewOpponent() {
+        val current = socket
+        if (current?.connected() != true || !sessionReady) return
+        current.emit("room:leave", io.socket.client.Ack { args ->
+            mainHandler.post {
+                if (socket !== current || args.firstOrNull() !is JSONObject) return@post
+                val response = args[0] as JSONObject
+                if (!response.optBoolean("ok")) { mutableRoomError.value = response.optString("error", "Could not leave ranked match"); return@post }
+                mutableRoom.value = null
+                clearOnlineMatch()
+                mutableState.value = BattleState(phase = BattlePhase.HOME, battleId = mutableState.value.battleId + 1)
+                findMatch()
+            }
+        })
     }
 
     private fun requestOnlineSnapshot() {
@@ -620,7 +679,12 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
             value.optBoolean("matchActive"),
             value.optString("hostName"),
             value.optString("guestName"),
-            roomDifficulty
+            roomDifficulty,
+            value.optBoolean("ranked"),
+            value.optInt("hostRating", 1000),
+            if (value.has("guestRating") && !value.isNull("guestRating")) value.optInt("guestRating") else null,
+            value.optString("hostTier", "Silver"),
+            value.optString("guestTier").takeIf { it.isNotBlank() }
         )
         mutableDifficulty.value = roomDifficulty
         mutableRoomError.value = ""
@@ -663,10 +727,12 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
             (onlineMatch.value != null && state.value.phase != BattlePhase.RESULT)) return
         val role = roleForSocket() ?: return
         clearOnlineMatch()
+        mutableRankedResult.value = RankedResult(ranked = value.optBoolean("ranked"))
         cancelBot()
         mutableProfile.value = profile.value.copy(editing = false)
         val info = OnlineMatchInfo(value.optString("matchId"), value.optLong("questionId"), role,
-            value.optString("hostName"), value.optString("guestName"), parseDifficulty(value.optString("difficulty")))
+            value.optString("hostName"), value.optString("guestName"), parseDifficulty(value.optString("difficulty")),
+            value.optBoolean("ranked"), value.optInt("hostRating", 1000), value.optInt("guestRating", 1000), value.optString("hostTier", "Silver"), value.optString("guestTier", "Silver"))
         mutableOnlineMatch.value = info
         onlineRevision = value.optLong("revision", 1L)
         mutableOnlineAnswerLocked.value = false
@@ -735,6 +801,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
             return
         }
         onlineRevision = revision
+        applyRankedResult(value)
         onlineResult = value.optString("winner")
         clearPendingAnswer()
         mutableOnlineAnswerLocked.value = true
@@ -807,6 +874,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                 mutableOnlineAnswerLocked.value = true
                 val winner = value.optString("winner")
                 onlineResult = winner
+                applyRankedResult(value)
                 mutableOnlineSubmissionStatus.value = value.optString("message", "")
                 mutableState.value = onlineBattleState(question, updatedInfo, hostHp, guestHp, BattlePhase.RESULT)
                     .copy(winner = if (winner.equals(info.role, true)) Fighter.PLAYER else Fighter.BOT)
@@ -814,6 +882,16 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
             }
         }
     }
+
+    private fun applyRankedResult(value: JSONObject) {
+        if (value.optString("matchType") != "RANKED") { mutableRankedResult.value = RankedResult(); return }
+        val rating = value.optJSONObject("rating")
+        if (rating == null) { mutableRankedResult.value = RankedResult(ranked = true); return }
+        val role = roleForSocket(); val host = role.equals("host", true)
+        mutableRankedResult.value = RankedResult(true, true, rating.optInt(if (host) "hostRatingBefore" else "guestRatingBefore", 1000), rating.optInt(if (host) "hostRatingDelta" else "guestRatingDelta"), rating.optInt(if (host) "hostRatingAfter" else "guestRatingAfter", 1000), if (host) tierForRating(rating.optInt("hostRatingAfter", 1000)) else tierForRating(rating.optInt("guestRatingAfter", 1000)))
+    }
+
+    private fun tierForRating(rating: Int) = when { rating < 900 -> "Bronze"; rating < 1100 -> "Silver"; rating < 1300 -> "Gold"; rating < 1500 -> "Platinum"; else -> "Diamond" }
 
     private fun acknowledgeFreshQuestion(value: JSONObject) {
         val current = socket ?: return
@@ -1011,7 +1089,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                 roleForSocket()?.let { role ->
                     cancelBot()
                             mutableOnlineMatch.value = OnlineMatchInfo(snapshot.optString("matchId"), snapshot.optLong("questionId"), role,
-                                snapshot.optString("hostName"), snapshot.optString("guestName"), parseDifficulty(snapshot.optString("difficulty")))
+                                snapshot.optString("hostName"), snapshot.optString("guestName"), parseDifficulty(snapshot.optString("difficulty")), snapshot.optBoolean("ranked"), snapshot.optInt("hostRating", 1000), snapshot.optInt("guestRating", 1000), snapshot.optString("hostTier", "Silver"), snapshot.optString("guestTier", "Silver"))
                 }
             }
             applyOnlineSnapshot(snapshot)

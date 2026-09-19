@@ -56,6 +56,9 @@ class MainActivity : ComponentActivity() {
             val onlineAnswerLocked by battleViewModel.onlineAnswerLocked.collectAsStateWithLifecycle()
             val onlineSubmissionStatus by battleViewModel.onlineSubmissionStatus.collectAsStateWithLifecycle()
             val onlinePaused by battleViewModel.onlinePaused.collectAsStateWithLifecycle()
+            val leaderboard by battleViewModel.leaderboard.collectAsStateWithLifecycle()
+            val leaderboardOpen by battleViewModel.leaderboardOpen.collectAsStateWithLifecycle()
+            val rankedResult by battleViewModel.rankedResult.collectAsStateWithLifecycle()
             val view = LocalView.current
             var impactToken by remember { mutableStateOf<PhaseKey?>(null) }
             LaunchedEffect(onlinePaused) {
@@ -92,7 +95,13 @@ class MainActivity : ComponentActivity() {
                 } else {
                 MathFightApp(
                     displayName = profile.displayName,
+                    profileStats = profile.stats,
                     onProfile = battleViewModel::openProfile,
+                    leaderboard = leaderboard,
+                    leaderboardOpen = leaderboardOpen,
+                    onLeaderboard = battleViewModel::openLeaderboard,
+                    onCloseLeaderboard = battleViewModel::closeLeaderboard,
+                    rankedResult = rankedResult,
                     search = search,
                     onFindMatch = battleViewModel::findMatch,
                     onCancelMatch = battleViewModel::cancelMatch,
@@ -131,6 +140,7 @@ class MainActivity : ComponentActivity() {
                         audio.stop()
                         if (onlineMatch != null) battleViewModel.leaveOnlineLobby() else battleViewModel.restartBattle()
                     },
+                    onFindNewOpponent = battleViewModel::findNewOpponent,
                     onDigit = battleViewModel::digit,
                     onBackspace = battleViewModel::backspace,
                     onClear = battleViewModel::clear,

@@ -8,6 +8,7 @@ export class PlayerEntity {
   @Index({ unique: true }) @Column({ name: 'account_token_hash', length: 64 }) accountTokenHash!: string;
   @Column({ default: 0 }) wins!: number;
   @Column({ default: 0 }) losses!: number;
+  @Index() @Column({ default: 1000 }) rating!: number;
   @CreateDateColumn({ name: 'created_at', type: 'timestamptz' }) createdAt!: Date;
   @UpdateDateColumn({ name: 'updated_at', type: 'timestamptz' }) updatedAt!: Date;
 }
@@ -23,6 +24,13 @@ export class CompletedMatchEntity {
   @Column({ name: 'winner_id', type: 'uuid' }) winnerId!: string;
   @Column({ length: 8 }) difficulty!: string;
   @Column({ name: 'finish_reason', length: 8 }) finishReason!: 'normal' | 'forfeit';
+  @Column({ name: 'match_type', length: 8, default: 'UNRANKED' }) matchType!: 'RANKED' | 'UNRANKED';
+  @Column({ name: 'host_rating_before', type: 'smallint', nullable: true }) hostRatingBefore!: number | null;
+  @Column({ name: 'guest_rating_before', type: 'smallint', nullable: true }) guestRatingBefore!: number | null;
+  @Column({ name: 'host_rating_after', type: 'smallint', nullable: true }) hostRatingAfter!: number | null;
+  @Column({ name: 'guest_rating_after', type: 'smallint', nullable: true }) guestRatingAfter!: number | null;
+  @Column({ name: 'host_rating_delta', type: 'smallint', nullable: true }) hostRatingDelta!: number | null;
+  @Column({ name: 'guest_rating_delta', type: 'smallint', nullable: true }) guestRatingDelta!: number | null;
   @Column({ name: 'host_hp', type: 'smallint' }) hostHp!: number;
   @Column({ name: 'guest_hp', type: 'smallint' }) guestHp!: number;
   @Index() @Column({ name: 'started_at', type: 'timestamptz' }) startedAt!: Date;

@@ -47,13 +47,20 @@ import com.droidnova.mathfight.game.Difficulty
 import com.droidnova.mathfight.game.Fighter
 import com.droidnova.mathfight.game.STARTING_HP
 import com.droidnova.mathfight.game.PhaseKey
+import com.droidnova.mathfight.profile.ProfileStats
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 
 @Composable
 fun MathFightApp(
     displayName: String,
+    profileStats: ProfileStats?,
     onProfile: () -> Unit,
+    leaderboard: LeaderboardState,
+    leaderboardOpen: Boolean,
+    onLeaderboard: () -> Unit,
+    onCloseLeaderboard: () -> Unit,
+    rankedResult: RankedResult,
     search: MatchSearchState,
     onFindMatch: () -> Unit,
     onCancelMatch: () -> Unit,
@@ -68,6 +75,7 @@ fun MathFightApp(
     onVibration: (Boolean) -> Unit,
     onStart: () -> Unit,
     onRestart: () -> Unit,
+    onFindNewOpponent: () -> Unit,
     onDigit: (Int) -> Unit,
     onBackspace: () -> Unit,
     onClear: () -> Unit,
@@ -95,17 +103,18 @@ fun MathFightApp(
     val localName = onlineMatch?.localName ?: displayName
     val opponentName = onlineMatch?.opponentName ?: "Bot"
     val searchingWithoutRoom = search.active && room == null
-    BackHandler(enabled = searchingWithoutRoom || state.phase != BattlePhase.HOME || room != null ||
+    BackHandler(enabled = leaderboardOpen || searchingWithoutRoom || state.phase != BattlePhase.HOME || room != null ||
         connectionStatus == BattleViewModel.ConnectionStatus.CONNECTED ||
         connectionStatus == BattleViewModel.ConnectionStatus.CONNECTING,
-        onBack = if (searchingWithoutRoom) onCancelMatch else onReturnHome)
+        onBack = when { leaderboardOpen -> onCloseLeaderboard; searchingWithoutRoom -> onCancelMatch; else -> onReturnHome })
     when (state.phase) {
-        BattlePhase.HOME -> if (searchingWithoutRoom) SearchScreen(displayName, search, onCancelMatch)
+        BattlePhase.HOME -> if (leaderboardOpen) LeaderboardScreen(leaderboard, onCloseLeaderboard)
+        else if (searchingWithoutRoom) SearchScreen(displayName, profileStats, search, onCancelMatch)
         else HomeScreen(onStart, settings, onSound, onVibration,
             debugConnection, serverUrl, connectionStatus, connectionMessage, onServerUrl, onConnect, onDisconnect,
             roomCodeInput, room, roomError, onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom, onReady, onProfile, onFindMatch,
-            difficulty, onDifficulty)
-        BattlePhase.RESULT -> ResultScreen(state.winner, onRestart, onlineMatch != null, onlineSubmissionStatus, localName, opponentName)
+            difficulty, onDifficulty, onLeaderboard)
+        BattlePhase.RESULT -> ResultScreen(state.winner, onRestart, onFindNewOpponent, onlineMatch != null, onlineSubmissionStatus, localName, opponentName, rankedResult)
         else -> BattleScreen(
             state = state,
             isResumed = isResumed,
@@ -138,7 +147,7 @@ private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
                        roomCodeInput: String, room: RoomInfo?, roomError: String,
                        onRoomCode: (String) -> Unit, onCreateRoom: () -> Unit,
                        onJoinRoom: () -> Unit, onLeaveRoom: () -> Unit, onReady: () -> Unit, onProfile: () -> Unit,
-                       onFindMatch: () -> Unit, difficulty: Difficulty, onDifficulty: (Difficulty) -> Unit) {
+                       onFindMatch: () -> Unit, difficulty: Difficulty, onDifficulty: (Difficulty) -> Unit, onLeaderboard: () -> Unit) {
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(24.dp),
@@ -147,6 +156,7 @@ private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
         ) {
             Text("Math Fight", style = MaterialTheme.typography.displaySmall)
             TextButton(onClick = onProfile, enabled = room?.matchActive != true) { Text("Profile") }
+            TextButton(onClick = onLeaderboard, enabled = room?.matchActive != true) { Text("Leaderboard") }
             DifficultySelector(difficulty, onDifficulty)
             if (debugConnection) {
             ConnectionCheckPanel(serverUrl, connectionStatus, connectionMessage,
@@ -172,8 +182,8 @@ private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
 }
 
 @Composable
-private fun ResultScreen(winner: Fighter?, onRestart: () -> Unit, online: Boolean, message: String,
-                         localName: String, opponentName: String) {
+private fun ResultScreen(winner: Fighter?, onRestart: () -> Unit, onFindNewOpponent: () -> Unit, online: Boolean, message: String,
+                         localName: String, opponentName: String, rankedResult: RankedResult) {
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
@@ -186,12 +196,14 @@ private fun ResultScreen(winner: Fighter?, onRestart: () -> Unit, online: Boolea
             )
             Text("$localName vs $opponentName", modifier = Modifier.padding(top = 12.dp), textAlign = TextAlign.Center)
             if (online && message.isNotBlank()) Text(message, modifier = Modifier.padding(top = 12.dp))
-            Button(
-                onClick = onRestart,
-                modifier = Modifier.padding(top = 28.dp).heightIn(min = 48.dp)
-            ) {
-                Text(if (online) "Return to Lobby" else "Restart")
+            if (rankedResult.ranked) {
+                if (rankedResult.available) Text("Rating ${rankedResult.before} ${if (rankedResult.delta >= 0) "+${rankedResult.delta}" else rankedResult.delta} → ${rankedResult.after}\n${rankedResult.tier}", modifier = Modifier.padding(top = 12.dp), textAlign = TextAlign.Center)
+                else Text("Rating unavailable", modifier = Modifier.padding(top = 12.dp))
             }
+            if (online && rankedResult.ranked) {
+                Button(onClick = onFindNewOpponent, modifier = Modifier.padding(top = 28.dp).heightIn(min = 48.dp)) { Text("Find New Opponent") }
+                OutlinedButton(onClick = onRestart, modifier = Modifier.padding(top = 8.dp).heightIn(min = 48.dp)) { Text("Return to Home") }
+            } else Button(onClick = onRestart, modifier = Modifier.padding(top = 28.dp).heightIn(min = 48.dp)) { Text(if (online) "Return to Lobby" else "Restart") }
         }
     }
 }
@@ -268,15 +280,37 @@ private fun BattleScreen(
 }
 
 @Composable
-private fun SearchScreen(displayName: String, search: MatchSearchState, onCancel: () -> Unit) {
+private fun SearchScreen(displayName: String, profileStats: ProfileStats?, search: MatchSearchState, onCancel: () -> Unit) {
     Surface(Modifier.fillMaxSize()) {
         Column(Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center) {
             Text("Finding an opponent…", style = MaterialTheme.typography.headlineSmall)
             Text(displayName, modifier = Modifier.padding(top = 12.dp))
+            profileStats?.let { Text("Rating: ${it.rating} • ${it.tier}") }
             Text("Mode: ${search.difficulty.name.lowercase().replaceFirstChar { it.uppercase() }}")
             if (search.error.isNotBlank()) Text(search.error, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(top = 12.dp))
             OutlinedButton(onClick = onCancel, modifier = Modifier.padding(top = 24.dp)) { Text("Cancel Search") }
+        }
+    }
+}
+
+@Composable
+private fun LeaderboardScreen(state: LeaderboardState, onBack: () -> Unit) {
+    BackHandler(onBack = onBack)
+    Surface(Modifier.fillMaxSize()) {
+        Column(Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("Leaderboard", style = MaterialTheme.typography.headlineSmall)
+            when {
+                state.loading -> Text("Loading…", Modifier.padding(top = 20.dp))
+                !state.connected -> Text(state.error.ifBlank { "Connect to the server" }, Modifier.padding(top = 20.dp))
+                state.error.isNotBlank() -> Text(state.error, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(top = 20.dp))
+                state.rows.isEmpty() -> Text("No ranked players yet", Modifier.padding(top = 20.dp))
+                else -> {
+                    if (state.currentPosition > 0) Text("Your position: #${state.currentPosition}", Modifier.padding(top = 12.dp))
+                    state.rows.forEach { row -> Text("#${row.position}  ${row.displayName}  ${row.rating} (${row.tier})  W${row.wins} L${row.losses}", fontWeight = if (row.current) FontWeight.Bold else FontWeight.Normal, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) }
+                }
+            }
+            OutlinedButton(onClick = onBack, Modifier.padding(top = 24.dp)) { Text("Back") }
         }
     }
 }
@@ -347,6 +381,7 @@ private fun ConnectionCheckPanel(
                 Text("Role: ${room.role}")
                 Text("Players: ${room.playerCount}/2")
                 Text("Difficulty: ${room.difficulty.name.lowercase().replaceFirstChar { it.uppercase() }}")
+                if (room.ranked) Text("Ranked • Host ${room.hostRating} ${room.hostTier} • Guest ${room.guestRating ?: "—"} ${room.guestTier ?: ""}")
                 if (room.role.equals("Host", true) && !room.matchActive) DifficultySelector(room.difficulty, onDifficulty)
                 Text("Host: ${room.hostName} • ${if (room.hostReady) "Ready" else "Not ready"}")
                 Text("Guest: ${room.guestName.ifBlank { "Waiting…" }} • ${if (room.guestReady) "Ready" else "Not ready"}")

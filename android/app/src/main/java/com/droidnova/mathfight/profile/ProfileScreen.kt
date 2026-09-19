@@ -46,12 +46,13 @@ fun ProfileScreen(state: ProfileUiState, onName: (String) -> Unit, onSave: () ->
                         state.statsLoading -> Text("Loading statistics…", Modifier.padding(top = 16.dp))
                         state.stats != null -> {
                             val stats = state.stats
+                            Text("Rating: ${stats.rating} • ${stats.tier} • Position #${stats.leaderboardPosition}", Modifier.padding(top = 16.dp))
                             Text("Matches played: ${stats.matchesPlayed}   Wins: ${stats.wins}   Losses: ${stats.losses}", Modifier.padding(top = 16.dp))
                             Text("Win rate: ${(stats.winRate * 100).toInt()}%", Modifier.padding(top = 4.dp))
                             if (stats.matches.isNotEmpty()) {
                                 Text("Recent matches", style = MaterialTheme.typography.titleSmall, modifier = Modifier.padding(top = 12.dp))
                                 stats.matches.forEach { match ->
-                                    Text("${match.result} vs ${match.opponentName} • ${match.difficulty.lowercase().replaceFirstChar { it.uppercase() }}${if (match.finishReason == "forfeit") " • forfeit" else ""}")
+                                    Text("${match.result} vs ${match.opponentName} • ${match.difficulty.lowercase().replaceFirstChar { it.uppercase() }} • ${if (match.matchType == "RANKED") "${match.ratingChange?.let { if (it >= 0) "+$it" else it.toString() } ?: "rating unavailable"}" else "Unranked"}${if (match.finishReason == "forfeit") " • forfeit" else ""}")
                                 }
                             }
                         }

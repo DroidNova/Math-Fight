@@ -7,9 +7,9 @@ import { AccountService } from './account.service';
 type Role = 'host' | 'guest';
 type Difficulty = 'EASY' | 'STANDARD' | 'EXPERT';
 type Question = { matchId: string; questionId: number; left: number; operation: 'ADD' | 'SUBTRACT' | 'MULTIPLY' | 'DIVIDE'; right: number };
-type Match = { matchId: string; difficulty: Difficulty; hostName: string; guestName: string; question: Question; phase: 'answering' | 'resolving' | 'paused' | 'resuming' | 'result'; hostHp: number; guestHp: number; revision: number; attacker?: Role; winner?: Role; message?: string; startedAt: Date; timer?: NodeJS.Timeout; requests: Map<string, object>; received: Set<string> };
-type Player = { id: string; token: string; profileId?: string; displayName?: string; accountId?: string; searchId?: string; socket?: Socket; roomCode?: string; deadline?: number; graceTimer?: NodeJS.Timeout };
-type Room = { code: string; difficulty: Difficulty; host: Player; guest?: Player; hostReady: boolean; guestReady: boolean; match?: Match };
+type Match = { matchId: string; difficulty: Difficulty; ranked: boolean; hostName: string; guestName: string; question: Question; phase: 'answering' | 'resolving' | 'paused' | 'resuming' | 'result'; hostHp: number; guestHp: number; revision: number; attacker?: Role; winner?: Role; message?: string; startedAt: Date; timer?: NodeJS.Timeout; requests: Map<string, object>; received: Set<string> };
+type Player = { id: string; token: string; profileId?: string; displayName?: string; accountId?: string; rating?: number; searchId?: string; socket?: Socket; roomCode?: string; deadline?: number; graceTimer?: NodeJS.Timeout };
+type Room = { code: string; difficulty: Difficulty; ranked: boolean; host: Player; guest?: Player; hostReady: boolean; guestReady: boolean; match?: Match };
 type SearchEntry = { player: Player; searchId: string; difficulty: Difficulty; joinedAt: number };
 
 @WebSocketGateway({ cors: true, pingInterval: 3_000, pingTimeout: 5_000 })
@@ -18,6 +18,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   private readonly rooms = new Map<string, Room>();
   private readonly players = new Map<string, Player>();
   private readonly matchmakingQueue: SearchEntry[] = [];
+  private matchmakingTimer?: NodeJS.Timeout;
 
   handleConnection(client: Socket) { console.log(`Socket connected: ${client.id}`); }
   handleDisconnect(client: Socket) {
@@ -112,6 +113,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     player.profileId = profileId;
     player.displayName = name;
     player.accountId = account.player.id;
+    player.rating = account.player.rating;
     if (room) this.emitState(room.code);
     return { ok: true, displayName: name, accountToken: account.issuedToken, room: room ? this.roomState(room, player) : undefined };
   }
@@ -124,9 +126,18 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     return stats ? { ok: true, ...stats } : { ok: false, error: 'Statistics unavailable' };
   }
 
+  @SubscribeMessage('leaderboard:get')
+  async getLeaderboard(@ConnectedSocket() client: Socket) {
+    const player = this.playerFor(client);
+    if (!player?.accountId) return { ok: false, error: 'Profile is not registered' };
+    return { ok: true, ...(await this.accounts.leaderboard(player.accountId)) };
+  }
+
   private parseDifficulty(value: unknown): Difficulty | undefined {
     return value === 'EASY' || value === 'STANDARD' || value === 'EXPERT' ? value : undefined;
   }
+
+  private tier(rating: number) { return rating < 900 ? 'Bronze' : rating < 1100 ? 'Silver' : rating < 1300 ? 'Gold' : rating < 1500 ? 'Platinum' : 'Diamond'; }
 
   @SubscribeMessage('connection:check')
   connectionCheck(@ConnectedSocket() _client: Socket) {
@@ -145,6 +156,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     const searchId = randomUUID();
     player.searchId = searchId;
     this.matchmakingQueue.push({ player, searchId, difficulty, joinedAt: Date.now() });
+    this.startMatchmakingTimer();
     this.emitSearchStatus(player, searchId, 'waiting', difficulty);
     this.pairSearchers(difficulty);
     return { ok: true, status: 'waiting', searchId, difficulty };
@@ -177,6 +189,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     if (index < 0) return false;
     this.matchmakingQueue.splice(index, 1);
     player.searchId = undefined;
+    if (!this.matchmakingQueue.length && this.matchmakingTimer) { clearInterval(this.matchmakingTimer); this.matchmakingTimer = undefined; }
     return true;
   }
 
@@ -185,7 +198,11 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     const matching = this.matchmakingQueue.filter(entry => entry.difficulty === difficulty);
     while (matching.length >= 2) {
       const first = matching.shift()!;
-      const second = matching.shift()!;
+      const now = Date.now();
+      const maxDifference = Math.min(300, Math.max(100, Math.floor((now - first.joinedAt) / 10_000) * 100 + 100));
+      const secondIndex = matching.findIndex(entry => Math.abs((entry.player.rating ?? 1000) - (first.player.rating ?? 1000)) <= maxDifference || now - first.joinedAt >= 30_000);
+      if (secondIndex < 0) break;
+      const second = matching.splice(secondIndex, 1)[0];
       this.matchmakingQueue.splice(this.matchmakingQueue.indexOf(first), 1);
       this.matchmakingQueue.splice(this.matchmakingQueue.indexOf(second), 1);
       if (first.player === second.player || first.player.id === second.player.id) continue;
@@ -193,6 +210,15 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
       second.player.searchId = undefined;
       this.createMatchedRoom(first, second);
     }
+  }
+
+  private startMatchmakingTimer() {
+    if (this.matchmakingTimer) return;
+    this.matchmakingTimer = setInterval(() => {
+      this.discardInvalidSearchers();
+      for (const difficulty of ['EASY', 'STANDARD', 'EXPERT'] as Difficulty[]) this.pairSearchers(difficulty);
+      if (!this.matchmakingQueue.length && this.matchmakingTimer) { clearInterval(this.matchmakingTimer); this.matchmakingTimer = undefined; }
+    }, 1_000);
   }
 
   private discardInvalidSearchers() {
@@ -210,7 +236,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     if (Math.random() < 0.5) [host, guest] = [guest, host];
     let code = '';
     do { code = this.generateCode(); } while (this.rooms.has(code));
-    const room: Room = { code, difficulty: first.difficulty, host, guest, hostReady: false, guestReady: false };
+    const room: Room = { code, difficulty: first.difficulty, ranked: true, host, guest, hostReady: false, guestReady: false };
     this.rooms.set(code, room);
     host.roomCode = code;
     guest.roomCode = code;
@@ -218,8 +244,8 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     const guestState = this.roomState(room, guest);
     const hostSearchId = host === first.player ? first.searchId : second.searchId;
     const guestSearchId = guest === first.player ? first.searchId : second.searchId;
-    host.socket?.emit('matchmaking:matched', { searchId: hostSearchId, difficulty: room.difficulty, opponentName: guest.displayName, role: 'host', room: hostState });
-    guest.socket?.emit('matchmaking:matched', { searchId: guestSearchId, difficulty: room.difficulty, opponentName: host.displayName, role: 'guest', room: guestState });
+    host.socket?.emit('matchmaking:matched', { searchId: hostSearchId, difficulty: room.difficulty, opponentName: guest.displayName, opponentRating: guest.rating ?? 1000, opponentTier: this.tier(guest.rating ?? 1000), role: 'host', room: hostState });
+    guest.socket?.emit('matchmaking:matched', { searchId: guestSearchId, difficulty: room.difficulty, opponentName: host.displayName, opponentRating: host.rating ?? 1000, opponentTier: this.tier(host.rating ?? 1000), role: 'guest', room: guestState });
     this.emitState(code);
   }
 
@@ -233,7 +259,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     if (!difficulty) return { ok: false, error: 'Invalid difficulty' };
     let code = '';
     do { code = this.generateCode(); } while (this.rooms.has(code));
-    this.rooms.set(code, { code, difficulty, host: player, hostReady: false, guestReady: false });
+    this.rooms.set(code, { code, difficulty, ranked: false, host: player, hostReady: false, guestReady: false });
     player.roomCode = code;
     this.emitState(code);
     return { ok: true, room: this.roomState(this.rooms.get(code)!, player) };
@@ -258,7 +284,11 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
 
   @SubscribeMessage('room:leave')
   leaveRoomMessage(@ConnectedSocket() client: Socket) {
-    return this.leaveSession(client);
+    const player = this.playerFor(client);
+    if (!player) return { ok: false, error: 'Connect again to start a session' };
+    this.removeSearch(player);
+    this.leaveRoom(player);
+    return { ok: true };
   }
 
   @SubscribeMessage('room:ready')
@@ -395,20 +425,21 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
 
   private roomState(room: Room, player: Player) {
     return { code: room.code, role: room.host === player ? 'host' : 'guest', playerCount: room.guest ? 2 : 1,
-      difficulty: room.difficulty, hostName: room.host.displayName, guestName: room.guest?.displayName,
+      difficulty: room.difficulty, ranked: room.ranked, hostName: room.host.displayName, guestName: room.guest?.displayName,
+      hostRating: room.host.rating ?? 1000, guestRating: room.guest?.rating, hostTier: this.tier(room.host.rating ?? 1000), guestTier: room.guest ? this.tier(room.guest.rating ?? 1000) : undefined,
       hostReady: room.hostReady, guestReady: room.guestReady, matchActive: Boolean(room.match && room.match.phase !== 'result') };
   }
 
   private startMatch(room: Room) {
     const matchId = randomUUID();
     const question = this.makeQuestion(matchId, 1, room.difficulty);
-    room.match = { matchId, difficulty: room.difficulty, hostName: room.host.displayName!, guestName: room.guest!.displayName!, question, phase: 'answering', hostHp: 100, guestHp: 100, revision: 1, requests: new Map(), received: new Set(), startedAt: new Date() };
+    room.match = { matchId, difficulty: room.difficulty, ranked: room.ranked, hostName: room.host.displayName!, guestName: room.guest!.displayName!, question, phase: 'answering', hostHp: 100, guestHp: 100, revision: 1, requests: new Map(), received: new Set(), startedAt: new Date() };
     this.emitState(room.code);
-    const payload = { ...question, difficulty: room.match.difficulty, hostName: room.match.hostName, guestName: room.match.guestName, playerHp: 100, opponentHp: 100, revision: room.match.revision };
+    const payload = { ...question, difficulty: room.match.difficulty, ranked: room.match.ranked, matchType: room.match.ranked ? 'RANKED' : 'UNRANKED', hostName: room.match.hostName, guestName: room.match.guestName, playerHp: 100, opponentHp: 100, revision: room.match.revision };
     this.broadcastMatch(room, 'match:start', payload);
   }
 
-  private finishMatch(room: Room, attacker: Role, message?: string) {
+  private async finishMatch(room: Room, attacker: Role, message?: string) {
     const match = room.match;
     if (!match || match.phase === 'result') return;
     clearTimeout(match.timer);
@@ -418,8 +449,13 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     match.winner = attacker;
     match.message = message;
     match.revision++;
-    this.broadcastMatch(room, 'match:result', this.snapshot(match, room));
-    void this.accounts.recordMatch({ matchId: match.matchId, hostId: room.host.accountId, guestId: room.guest?.accountId, hostName: match.hostName, guestName: match.guestName, winnerId: attacker === 'host' ? room.host.accountId : room.guest?.accountId, difficulty: match.difficulty, finishReason: message ? 'forfeit' : 'normal', hostHp: match.hostHp, guestHp: match.guestHp, startedAt: match.startedAt }).catch(() => undefined);
+    let rating: object | undefined;
+    try {
+      const recorded = await this.accounts.recordMatch({ matchId: match.matchId, hostId: room.host.accountId, guestId: room.guest?.accountId, hostName: match.hostName, guestName: match.guestName, winnerId: attacker === 'host' ? room.host.accountId : room.guest?.accountId, difficulty: match.difficulty, finishReason: message ? 'forfeit' : 'normal', hostHp: match.hostHp, guestHp: match.guestHp, startedAt: match.startedAt, matchType: match.ranked ? 'RANKED' : 'UNRANKED' });
+      if (recorded) rating = recorded;
+      if (match.ranked && recorded?.recorded) { room.host.rating = recorded.hostRatingAfter ?? room.host.rating; if (room.guest) room.guest.rating = recorded.guestRatingAfter ?? room.guest.rating; }
+    } catch { rating = undefined; }
+    this.broadcastMatch(room, 'match:result', { ...this.snapshot(match, room), matchType: match.ranked ? 'RANKED' : 'UNRANKED', rating });
     room.hostReady = false;
     room.guestReady = false;
     this.emitState(room.code);
@@ -428,10 +464,10 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   private snapshot(match: Match, room?: Room) {
     const deadlines = [room?.host.deadline, room?.guest?.deadline].filter((value): value is number => value !== undefined);
     return { matchId: match.matchId, difficulty: match.difficulty, questionId: match.question.questionId, phase: match.phase,
-      hostName: match.hostName, guestName: match.guestName,
+      hostName: match.hostName, guestName: match.guestName, hostRating: room?.host.rating ?? 1000, guestRating: room?.guest?.rating ?? 1000, hostTier: this.tier(room?.host.rating ?? 1000), guestTier: this.tier(room?.guest?.rating ?? 1000),
       question: { left: match.question.left, operation: match.question.operation, right: match.question.right },
       playerHp: match.hostHp, opponentHp: match.guestHp, attacker: match.attacker, winner: match.winner, revision: match.revision,
-      message: match.message, deadline: deadlines.length ? Math.min(...deadlines) : undefined, serverNow: Date.now() };
+      message: match.message, ranked: match.ranked, matchType: match.ranked ? 'RANKED' : 'UNRANKED', deadline: deadlines.length ? Math.min(...deadlines) : undefined, serverNow: Date.now() };
   }
 
   private broadcastMatch(room: Room, event: string, payload: object) {
@@ -535,6 +571,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   }
 
   onApplicationShutdown() {
+    if (this.matchmakingTimer) clearInterval(this.matchmakingTimer);
     for (const room of this.rooms.values()) clearTimeout(room.match?.timer);
     for (const player of this.players.values()) clearTimeout(player.graceTimer);
     this.rooms.clear();
