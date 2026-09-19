@@ -45,8 +45,16 @@ class MainActivity : ComponentActivity() {
             val roomError by battleViewModel.roomError.collectAsStateWithLifecycle()
             val onlineMatch by battleViewModel.onlineMatch.collectAsStateWithLifecycle()
             val onlineAnswerLocked by battleViewModel.onlineAnswerLocked.collectAsStateWithLifecycle()
+            val onlineSubmissionStatus by battleViewModel.onlineSubmissionStatus.collectAsStateWithLifecycle()
+            val onlinePaused by battleViewModel.onlinePaused.collectAsStateWithLifecycle()
             val view = LocalView.current
             var impactToken by remember { mutableStateOf<PhaseKey?>(null) }
+            LaunchedEffect(onlinePaused) {
+                if (onlinePaused) {
+                    impactToken = null
+                    audio.stop()
+                }
+            }
             LaunchedEffect(view) {
                 lifecycle.repeatOnLifecycle(Lifecycle.State.RESUMED) {
                     try {
@@ -87,6 +95,7 @@ class MainActivity : ComponentActivity() {
                     roomError = roomError,
                     onlineMatch = onlineMatch,
                     onlineAnswerLocked = onlineAnswerLocked,
+                    onlineSubmissionStatus = onlineSubmissionStatus,
                     onRoomCode = battleViewModel::setRoomCodeInput,
                     onCreateRoom = battleViewModel::createRoom,
                     onJoinRoom = battleViewModel::joinRoom,

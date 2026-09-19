@@ -34,6 +34,7 @@ import kotlinx.coroutines.launch
 import io.socket.client.IO
 import io.socket.client.Socket
 import org.json.JSONObject
+import java.util.UUID
 
 data class FeedbackSettings(val sound: Boolean = true, val vibration: Boolean = true)
 enum class FeedbackKind { HIT, KO }
@@ -47,6 +48,7 @@ data class RoomInfo(
     val matchActive: Boolean = false
 )
 data class OnlineMatchInfo(val matchId: String, val questionId: Long, val role: String)
+private data class PendingAnswer(val requestId: String, val matchId: String, val questionId: Long)
 
 class BattleViewModel : ViewModel() {
     private val mutableState = MutableStateFlow(BattleState())
@@ -73,6 +75,11 @@ class BattleViewModel : ViewModel() {
     private val mutableConnectionMessage = MutableStateFlow("")
     val connectionMessage = mutableConnectionMessage.asStateFlow()
     private var socket: Socket? = null
+    // Temporary, private credentials survive Activity recreation, but never process death.
+    private var playerId: String? = null
+    private var resumeToken: String? = null
+    private var sessionReady = false
+    private var sessionOperation = 0L
     private var connectionGeneration = 0L
     private var wantsConnection = false
     private var connectionForeground = false
@@ -95,6 +102,16 @@ class BattleViewModel : ViewModel() {
     private var onlineResolutionJob: Job? = null
     private var onlineResultJob: Job? = null
     private var onlineResult: String? = null
+    private var onlineRevision = 0L
+    private var pendingAnswer: PendingAnswer? = null
+    private var answerTimeoutJob: Job? = null
+    private val mutableOnlineSubmissionStatus = MutableStateFlow("")
+    val onlineSubmissionStatus = mutableOnlineSubmissionStatus.asStateFlow()
+    private val mutableOnlinePaused = MutableStateFlow(false)
+    val onlinePaused = mutableOnlinePaused.asStateFlow()
+    private var pauseCountdownJob: Job? = null
+    private var lastAttackQuestion = 0L
+    private var returnedMatchId: String? = null
 
     fun consumeImpact(token: PhaseKey): Boolean {
         if (!resumed.value || state.value.key != token || token.phase != BattlePhase.IMPACT ||
@@ -108,11 +125,13 @@ class BattleViewModel : ViewModel() {
 
     fun readyToggle() {
         val current = socket ?: return setRoomError("Connect to the server first")
+        if (!sessionReady || !current.connected()) return
         val currentRoom = room.value ?: return setRoomError("Join a room first")
+        val operation = roomOperationGeneration
         val ready = if (currentRoom.role.equals("Host", true)) !currentRoom.hostReady else !currentRoom.guestReady
         current.emit("room:ready", JSONObject().put("ready", ready), io.socket.client.Ack { args ->
             mainHandler.post {
-                if (socket !== current || args.isEmpty() || args[0] !is JSONObject) return@post
+                if (socket !== current || !sessionReady || operation != roomOperationGeneration || args.isEmpty() || args[0] !is JSONObject) return@post
                 val response = args[0] as JSONObject
                 if (!response.optBoolean("ok", false)) setRoomError(response.optString("error", "Ready request failed"))
             }
@@ -122,12 +141,11 @@ class BattleViewModel : ViewModel() {
     fun setServerUrl(value: String) {
         if (value == mutableServerUrl.value) return
         mutableServerUrl.value = value
-        leaveRoom()
-        wantsConnection = false
-        disposeSocket(ConnectionStatus.IDLE)
+        endParticipation()
     }
 
     fun connect() {
+        if (socket != null || connectionStatus.value == ConnectionStatus.CONNECTING) return
         val url = serverUrl.value.trim().trimEnd('/')
         if (url.isEmpty()) {
             mutableConnectionStatus.value = ConnectionStatus.ERROR
@@ -137,17 +155,12 @@ class BattleViewModel : ViewModel() {
         wantsConnection = true
         reconnectAttempt = 0
         reconnectJob?.cancel()
-        leaveRoom()
         disposeSocket(ConnectionStatus.IDLE)
         openSocket(url)
     }
 
     fun disconnect() {
-        wantsConnection = false
-        reconnectJob?.cancel()
-        reconnectJob = null
-        leaveRoom()
-        disposeSocket(ConnectionStatus.DISCONNECTED)
+        endParticipation()
     }
 
     fun setRoomCodeInput(value: String) {
@@ -157,7 +170,7 @@ class BattleViewModel : ViewModel() {
 
     fun createRoom() {
         val current = socket
-        if (current?.connected() != true) return setRoomError("Connect to the server first")
+        if (!sessionReady || current?.connected() != true) return setRoomError("Connect to the server first")
         val operation = ++roomOperationGeneration
         roomRequestPending = true
         current.emit("room:create", io.socket.client.Ack { args ->
@@ -172,7 +185,7 @@ class BattleViewModel : ViewModel() {
         val code = roomCodeInput.value
         if (code.length != 6) return setRoomError("Enter a 6-character room code")
         val current = socket
-        if (current?.connected() != true) return setRoomError("Connect to the server first")
+        if (!sessionReady || current?.connected() != true) return setRoomError("Connect to the server first")
         val operation = ++roomOperationGeneration
         roomRequestPending = true
         current.emit("room:join", JSONObject().put("code", code), io.socket.client.Ack { args ->
@@ -186,31 +199,85 @@ class BattleViewModel : ViewModel() {
     fun submitOnlineAnswer() {
         val match = onlineMatch.value ?: return
         if (mutableState.value.phase != BattlePhase.ANSWERING || mutableOnlineAnswerLocked.value || mutableState.value.input.isEmpty()) return
-        val current = socket ?: return
+        val current = socket
+        if (!sessionReady || !connectionForeground || current?.connected() != true) {
+            mutableOnlineSubmissionStatus.value = "Reconnecting\u2026"
+            return
+        }
         val answer = mutableState.value.input
+        val pending = PendingAnswer(UUID.randomUUID().toString(), match.matchId, match.questionId)
+        pendingAnswer = pending
+        answerTimeoutJob?.cancel()
+        mutableOnlineSubmissionStatus.value = "Checking…"
         mutableOnlineAnswerLocked.value = true
         mutableState.value = mutableState.value.copy(input = "", wrongAnswer = false)
         current.emit("match:answer", JSONObject()
             .put("matchId", match.matchId)
             .put("questionId", match.questionId)
+            .put("requestId", pending.requestId)
             .put("answer", answer), io.socket.client.Ack { args ->
             mainHandler.post {
-                if (socket !== current || mutableOnlineMatch.value?.matchId != match.matchId) return@post
+                if (socket !== current || !sessionReady || pendingAnswer != pending || mutableOnlineMatch.value != match || onlinePaused.value) return@post
                 val response = args.firstOrNull() as? JSONObject ?: return@post
-                if (!response.optBoolean("ok", false) && response.optBoolean("wrong", false)) {
+                if (response.optString("requestId") != pending.requestId || response.optString("matchId") != pending.matchId || response.optLong("questionId") != pending.questionId) return@post
+                pendingAnswer = null
+                answerTimeoutJob?.cancel()
+                mutableOnlineSubmissionStatus.value = ""
+                if (response.optBoolean("ok", false) && response.optString("result") == "correct") {
+                    // Remain locked until the authoritative attack or question update arrives.
+                    mutableOnlineAnswerLocked.value = true
+                } else if (response.optString("result") == "incorrect") {
                     mutableOnlineAnswerLocked.value = false
                     mutableState.value = mutableState.value.copy(input = "", wrongAnswer = true)
-                } else if (!response.optBoolean("ok", false)) {
+                } else if (response.optString("result") == "already_resolved" || response.optString("result") == "invalid") {
                     mutableOnlineAnswerLocked.value = false
-                    mutableState.value = mutableState.value.copy(input = "", wrongAnswer = true)
+                    requestOnlineSnapshot()
                 }
             }
         })
+        answerTimeoutJob = viewModelScope.launch {
+            delay(5_000L)
+            if (pendingAnswer == pending) {
+                mutableOnlineSubmissionStatus.value = "Connection slow"
+                requestOnlineSnapshot()
+                delay(3_000L)
+                if (pendingAnswer == pending) {
+                    pendingAnswer = null
+                    mutableOnlineAnswerLocked.value = false
+                }
+            }
+        }
     }
 
     fun leaveOnlineLobby() {
+        returnedMatchId = onlineMatch.value?.matchId
         clearOnlineMatch()
         mutableState.value = BattleState(phase = BattlePhase.HOME, battleId = mutableState.value.battleId + 1)
+    }
+
+    private fun requestOnlineSnapshot() {
+        val current = socket ?: return
+        if (!sessionReady || !current.connected()) return
+        val matchId = onlineMatch.value?.matchId ?: return
+        current.emit("match:state", io.socket.client.Ack { args ->
+            mainHandler.post {
+                if (socket !== current || onlineMatch.value?.matchId != matchId) return@post
+                val response = args.firstOrNull() as? JSONObject ?: return@post
+                if (response.optBoolean("ok", false)) {
+                    response.optJSONObject("snapshot")?.let { snapshot ->
+                        if (snapshot.optLong("revision") == onlineRevision && snapshot.optString("phase") == "answering") {
+                            clearPendingAnswer()
+                            mutableOnlineAnswerLocked.value = false
+                        }
+                        applyOnlineSnapshot(snapshot)
+                    }
+                } else if (response.optString("result") == "ended") {
+                    clearOnlineMatch()
+                    mutableState.value = BattleState(phase = BattlePhase.HOME, battleId = mutableState.value.battleId + 1)
+                    mutableRoomError.value = "Match ended"
+                }
+            }
+        })
     }
 
     private fun clearOnlineMatch() {
@@ -219,22 +286,81 @@ class BattleViewModel : ViewModel() {
         mutableOnlineMatch.value = null
         mutableOnlineAnswerLocked.value = false
         onlineResult = null
+        pendingAnswer = null
+        answerTimeoutJob?.cancel()
+        answerTimeoutJob = null
+        mutableOnlineSubmissionStatus.value = ""
+        onlineRevision = 0L
+        pauseCountdownJob?.cancel()
+        mutableOnlinePaused.value = false
+        lastAttackQuestion = 0L
     }
 
-    fun leaveRoom() {
+    private fun clearPendingAnswer() {
+        pendingAnswer = null
+        answerTimeoutJob?.cancel()
+        answerTimeoutJob = null
+        mutableOnlineSubmissionStatus.value = ""
+    }
+
+    private fun suspendOnlineMatch() {
+        roomOperationGeneration++
+        roomRequestPending = false
+        if (onlineMatch.value == null) return
+        clearPendingAnswer()
+        onlineResolutionJob?.cancel()
+        onlineResultJob?.cancel()
+        pauseCountdownJob?.cancel()
+        mutableOnlineAnswerLocked.value = true
+        mutableOnlinePaused.value = true
+        if (state.value.phase != BattlePhase.RESULT) {
+            mutableState.value = state.value.copy(phase = BattlePhase.ANSWERING, question = null,
+                input = "", wrongAnswer = false, attacker = null)
+            mutableOnlineSubmissionStatus.value = "Reconnecting\u2026"
+        }
+    }
+
+    fun leaveRoom() = endParticipation(keepConnection = true)
+
+    private fun endParticipation(keepConnection: Boolean = false) {
+        val sessionRequest = ++sessionOperation
         roomOperationGeneration++
         roomRequestPending = false
         val current = socket
-        if (current?.connected() == true && mutableRoom.value != null) {
-            current.emit("room:leave", io.socket.client.Ack { })
-        }
+        val generation = connectionGeneration
+        val keep = keepConnection && sessionReady && current?.connected() == true
+        playerId = null
+        resumeToken = null
+        sessionReady = false
+        wantsConnection = keep
+        reconnectJob?.cancel()
+        acknowledgementJob?.cancel()
         mutableRoom.value = null
         mutableRoomCodeInput.value = ""
         mutableRoomError.value = ""
+        val wasOnline = onlineMatch.value != null
+        returnedMatchId = onlineMatch.value?.matchId
         clearOnlineMatch()
-        if (mutableState.value.phase != BattlePhase.HOME) {
+        if (wasOnline) {
             mutableState.value = BattleState(phase = BattlePhase.HOME, battleId = mutableState.value.battleId + 1)
         }
+        mutableConnectionStatus.value = if (keep) ConnectionStatus.CONNECTING else ConnectionStatus.DISCONNECTED
+        mutableConnectionMessage.value = ""
+        if (current?.connected() == true) {
+            // Give the intentional leave packet time to reach the server before closing transport.
+            acknowledgementJob = viewModelScope.launch {
+                delay(3_000)
+                if (socket === current && connectionGeneration == generation) disposeSocket(ConnectionStatus.DISCONNECTED)
+            }
+            current.emit("session:leave", io.socket.client.Ack {
+                mainHandler.post {
+                    if (socket !== current || generation != connectionGeneration || sessionRequest != sessionOperation) return@post
+                    acknowledgementJob?.cancel()
+                    if (keep && wantsConnection && connectionForeground) authenticateSession(current, generation)
+                    else disposeSocket(ConnectionStatus.DISCONNECTED)
+                }
+            })
+        } else disposeSocket(ConnectionStatus.DISCONNECTED)
     }
 
     private fun setRoomError(message: String) { mutableRoomError.value = message }
@@ -268,7 +394,7 @@ class BattleViewModel : ViewModel() {
         mutableRoom.value = null
         mutableRoomCodeInput.value = ""
         if (!message.isNullOrBlank()) mutableRoomError.value = message
-        if (mutableOnlineMatch.value != null) {
+        if (mutableOnlineMatch.value != null && onlineResult == null && state.value.phase != BattlePhase.RESULT) {
             clearOnlineMatch()
             mutableState.value = BattleState(phase = BattlePhase.HOME, battleId = mutableState.value.battleId + 1)
         }
@@ -293,26 +419,48 @@ class BattleViewModel : ViewModel() {
     }
 
     private fun handleMatchStart(value: JSONObject) {
+        if (!sessionReady || value.optString("matchId") == returnedMatchId ||
+            (onlineMatch.value != null && state.value.phase != BattlePhase.RESULT)) return
         val role = roleForSocket() ?: return
+        clearOnlineMatch()
+        cancelBot()
         val info = OnlineMatchInfo(value.optString("matchId"), value.optLong("questionId"), role)
         mutableOnlineMatch.value = info
+        onlineRevision = value.optLong("revision", 1L)
         mutableOnlineAnswerLocked.value = false
+        pendingAnswer = null
+        mutableOnlineSubmissionStatus.value = ""
         onlineResult = null
         mutableState.value = onlineBattleState(onlineQuestion(value), info, value.optInt("playerHp", 100), value.optInt("opponentHp", 100), BattlePhase.ANSWERING)
     }
 
     private fun handleMatchQuestion(value: JSONObject) {
+        if (!sessionReady) return
         val old = mutableOnlineMatch.value ?: return
-        if (value.optString("matchId") != old.matchId || value.optLong("questionId") <= old.questionId) return
+        val revision = value.optLong("revision")
+        if (value.optString("matchId") != old.matchId || value.optLong("questionId") <= old.questionId || revision <= onlineRevision) return
+        onlineRevision = revision
         val info = old.copy(questionId = value.optLong("questionId"))
         mutableOnlineMatch.value = info
         mutableOnlineAnswerLocked.value = false
-        mutableState.value = onlineBattleState(onlineQuestion(value), info, mutableState.value.playerHp, mutableState.value.opponentHp, BattlePhase.ANSWERING)
+        pendingAnswer = null
+        answerTimeoutJob?.cancel()
+        mutableOnlineSubmissionStatus.value = ""
+        onlineResolutionJob?.cancel()
+        mutableState.value = onlineBattleState(onlineQuestion(value), info, value.optInt("playerHp"), value.optInt("opponentHp"), BattlePhase.ANSWERING)
     }
 
     private fun handleMatchAttack(value: JSONObject) {
+        if (!sessionReady) return
         val info = mutableOnlineMatch.value ?: return
-        if (value.optString("matchId") != info.matchId || value.optLong("questionId") != info.questionId || mutableState.value.phase != BattlePhase.ANSWERING) return
+        val revision = value.optLong("revision")
+        if (value.optString("matchId") != info.matchId || value.optLong("questionId") != info.questionId || revision <= onlineRevision ||
+            mutableState.value.phase != BattlePhase.ANSWERING || onlinePaused.value || info.questionId <= lastAttackQuestion) return
+        lastAttackQuestion = info.questionId
+        onlineRevision = revision
+        pendingAnswer = null
+        answerTimeoutJob?.cancel()
+        mutableOnlineSubmissionStatus.value = ""
         mutableOnlineAnswerLocked.value = true
         val attackerRole = value.optString("attacker")
         val attacker = if (attackerRole.equals(info.role, true)) Fighter.PLAYER else Fighter.BOT
@@ -323,22 +471,31 @@ class BattleViewModel : ViewModel() {
         onlineResolutionJob?.cancel()
         onlineResolutionJob = viewModelScope.launch {
             delay(180)
-            if (mutableOnlineMatch.value != info) return@launch
+            if (mutableOnlineMatch.value != info || onlinePaused.value || !sessionReady) return@launch
             mutableState.value = onlineBattleState(question, info, hostHp, guestHp, BattlePhase.IMPACT, attacker)
             mutableFeedback.tryEmit(CombatFeedback(mutableState.value.key, FeedbackKind.HIT))
             delay(320)
-            if (mutableOnlineMatch.value != info) return@launch
+            if (mutableOnlineMatch.value != info || onlinePaused.value || !sessionReady) return@launch
             if (value.optBoolean("ko")) {
-                mutableState.value = onlineBattleState(question, info, hostHp, guestHp, BattlePhase.KO, attacker)
+                mutableState.value = onlineBattleState(question, info, hostHp, guestHp, BattlePhase.KO, attacker).copy(winner = attacker)
                 mutableFeedback.tryEmit(CombatFeedback(mutableState.value.key, FeedbackKind.KO))
             }
         }
     }
 
     private fun handleMatchResult(value: JSONObject) {
+        if (!sessionReady) return
         val info = mutableOnlineMatch.value ?: return
-        if (value.optString("matchId") != info.matchId) return
+        val revision = value.optLong("revision")
+        if (value.optString("matchId") != info.matchId || revision <= onlineRevision) return
+        if (value.optString("message").isNotBlank() || onlinePaused.value) {
+            applyOnlineSnapshot(value)
+            return
+        }
+        onlineRevision = revision
         onlineResult = value.optString("winner")
+        clearPendingAnswer()
+        mutableOnlineAnswerLocked.value = true
         onlineResultJob?.cancel()
         onlineResultJob = viewModelScope.launch {
             delay(600)
@@ -351,6 +508,75 @@ class BattleViewModel : ViewModel() {
         }
     }
 
+    private fun applyOnlineSnapshot(value: JSONObject) {
+        if (!sessionReady) return
+        val info = mutableOnlineMatch.value ?: return
+        if (value.optString("matchId") != info.matchId) return
+        val revision = value.optLong("revision")
+        if (revision <= onlineRevision) return
+        val questionValue = value.optJSONObject("question") ?: return
+        val questionId = value.optLong("questionId")
+        val updatedInfo = info.copy(questionId = questionId)
+        onlineRevision = revision
+        mutableOnlineMatch.value = updatedInfo
+        clearPendingAnswer()
+        onlineResolutionJob?.cancel()
+        onlineResultJob?.cancel()
+        pauseCountdownJob?.cancel()
+        mutableOnlinePaused.value = value.optString("phase") in listOf("paused", "resuming")
+        val question = onlineQuestion(questionValue.put("questionId", questionId).put("matchId", info.matchId))
+        val hostHp = value.optInt("playerHp", 100)
+        val guestHp = value.optInt("opponentHp", 100)
+        when (value.optString("phase")) {
+            "answering" -> {
+                mutableOnlineAnswerLocked.value = false
+                mutableState.value = onlineBattleState(question, updatedInfo, hostHp, guestHp, BattlePhase.ANSWERING)
+            }
+            "resolving" -> {
+                mutableOnlineAnswerLocked.value = true
+                lastAttackQuestion = maxOf(lastAttackQuestion, questionId)
+                // Recovery updates HP silently; it never restarts an attack or its effects.
+                mutableState.value = onlineBattleState(question, updatedInfo, hostHp, guestHp, BattlePhase.ANSWERING)
+            }
+            "paused", "resuming" -> {
+                mutableOnlineAnswerLocked.value = true
+                lastAttackQuestion = maxOf(lastAttackQuestion, if (value.optString("phase") == "paused") questionId else questionId - 1)
+                mutableState.value = onlineBattleState(question, updatedInfo, hostHp, guestHp, BattlePhase.ANSWERING)
+                    .copy(question = if (value.optString("phase") == "paused") null else question)
+                if (value.optString("phase") == "resuming") {
+                    mutableOnlineSubmissionStatus.value = "Waiting for both players\u2026"
+                    acknowledgeFreshQuestion(value)
+                } else {
+                    val remaining = (value.optLong("deadline") - value.optLong("serverNow")).coerceAtLeast(0L)
+                    val localDeadline = SystemClock.elapsedRealtime() + remaining
+                    pauseCountdownJob = viewModelScope.launch {
+                        do {
+                            val seconds = ((localDeadline - SystemClock.elapsedRealtime()).coerceAtLeast(0L) + 999) / 1000
+                            mutableOnlineSubmissionStatus.value = "Opponent reconnecting\u2026 ${seconds}s"
+                            if (seconds == 0L) break
+                            delay(250)
+                        } while (onlineMatch.value == updatedInfo && onlineRevision == revision)
+                    }
+                }
+            }
+            "result" -> {
+                mutableOnlineAnswerLocked.value = true
+                val winner = value.optString("winner")
+                onlineResult = winner
+                mutableOnlineSubmissionStatus.value = value.optString("message", "")
+                mutableState.value = onlineBattleState(question, updatedInfo, hostHp, guestHp, BattlePhase.RESULT)
+                    .copy(winner = if (winner.equals(info.role, true)) Fighter.PLAYER else Fighter.BOT)
+            }
+        }
+    }
+
+    private fun acknowledgeFreshQuestion(value: JSONObject) {
+        val current = socket ?: return
+        if (!sessionReady || !current.connected()) return
+        current.emit("match:received", JSONObject().put("matchId", value.optString("matchId"))
+            .put("questionId", value.optLong("questionId")).put("revision", value.optLong("revision")))
+    }
+
     fun connectionPermissionDenied() {
         wantsConnection = false
         disposeSocket(ConnectionStatus.ERROR)
@@ -361,7 +587,8 @@ class BattleViewModel : ViewModel() {
         connectionForeground = value
         if (!value) {
             if (wantsConnection) {
-                leaveRoom()
+                reconnectJob?.cancel()
+                suspendOnlineMatch()
                 disposeSocket(ConnectionStatus.DISCONNECTED)
             }
         } else if (wantsConnection && socket == null) {
@@ -371,14 +598,15 @@ class BattleViewModel : ViewModel() {
     }
 
     private fun openSocket(url: String) {
-        if (!connectionForeground) return
+        if (!connectionForeground || socket != null || !wantsConnection) return
         val generation = ++connectionGeneration
         acknowledgementJob?.cancel()
         mutableConnectionStatus.value = ConnectionStatus.CONNECTING
         mutableConnectionMessage.value = "Connecting…"
         val options = IO.Options().apply {
-            timeout = 5_000
+            timeout = 3_000
             reconnection = false
+            forceNew = true
         }
         val created = try { IO.socket(url, options) } catch (error: Exception) {
             mutableConnectionStatus.value = ConnectionStatus.ERROR
@@ -388,14 +616,16 @@ class BattleViewModel : ViewModel() {
         socket = created
         created.on("room:state") { args ->
             mainHandler.post {
-                if (generation != connectionGeneration || socket !== created ||
+                if (generation != connectionGeneration || socket !== created || !sessionReady ||
                     (!roomRequestPending && mutableRoom.value == null)) return@post
                 if (args.isNotEmpty() && args[0] is JSONObject) updateRoom(args[0] as JSONObject)
             }
         }
         created.on("room:closed") { args ->
             mainHandler.post {
-                if (generation != connectionGeneration || socket !== created) return@post
+                if (generation != connectionGeneration || socket !== created || !sessionReady) return@post
+                val closed = args.firstOrNull() as? JSONObject ?: return@post
+                if (closed.optString("code") != room.value?.code) return@post
                 val message = if (args.isNotEmpty() && args[0] is JSONObject)
                     (args[0] as JSONObject).optString("message") else "Room closed"
                 clearRoomFromServer(message)
@@ -413,74 +643,136 @@ class BattleViewModel : ViewModel() {
         created.on("match:result") { args ->
             mainHandler.post { if (generation == connectionGeneration && socket === created && args.firstOrNull() is JSONObject) handleMatchResult(args[0] as JSONObject) }
         }
+        created.on("match:snapshot") { args ->
+            mainHandler.post { if (generation == connectionGeneration && socket === created && args.firstOrNull() is JSONObject) applyOnlineSnapshot(args[0] as JSONObject) }
+        }
+        for (event in listOf("match:paused", "match:resumed")) {
+            created.on(event) { args ->
+                mainHandler.post {
+                    if (generation == connectionGeneration && socket === created && sessionReady && args.firstOrNull() is JSONObject) {
+                        applyOnlineSnapshot(args[0] as JSONObject)
+                    }
+                }
+            }
+        }
         created.on("match:ended") { args ->
             mainHandler.post {
                 if (generation != connectionGeneration || socket !== created) return@post
+                val ended = args.firstOrNull() as? JSONObject ?: return@post
+                if (ended.optString("matchId") != onlineMatch.value?.matchId || ended.optLong("revision") <= onlineRevision) return@post
                 val message = if (args.firstOrNull() is JSONObject) (args[0] as JSONObject).optString("message") else "Opponent disconnected"
-                onlineResolutionJob?.cancel()
-                onlineResultJob?.cancel()
-                mutableOnlineMatch.value = null
-                mutableOnlineAnswerLocked.value = false
+                clearOnlineMatch()
                 mutableState.value = BattleState(phase = BattlePhase.HOME, battleId = mutableState.value.battleId + 1)
                 mutableRoomError.value = message.ifBlank { "Opponent disconnected" }
             }
         }
         created.on(Socket.EVENT_CONNECT) {
             mainHandler.post {
-                if (generation != connectionGeneration || socket !== created) return@post
-                mutableConnectionStatus.value = ConnectionStatus.CONNECTED
-                mutableConnectionMessage.value = "Connected"
-                acknowledgementJob?.cancel()
-                acknowledgementJob = viewModelScope.launch {
-                    delay(3_000L)
-                    if (generation == connectionGeneration && socket === created &&
-                        mutableConnectionStatus.value == ConnectionStatus.CONNECTED) {
-                        mutableConnectionStatus.value = ConnectionStatus.ERROR
-                        mutableConnectionMessage.value = "Server acknowledgement timed out"
-                    }
-                }
-                created.emit("connection:check", io.socket.client.Ack { args ->
-                    mainHandler.post {
-                        if (generation != connectionGeneration || socket !== created) return@post
-                        acknowledgementJob?.cancel()
-                        if (args.isNotEmpty() && args[0] is JSONObject) {
-                            mutableConnectionMessage.value = (args[0] as JSONObject).optString("message", "Connected")
-                        } else {
-                            mutableConnectionMessage.value = "Math Fight server ready"
-                        }
-                    }
-                })
+                if (generation != connectionGeneration || socket !== created || !wantsConnection || !connectionForeground) return@post
+                authenticateSession(created, generation)
             }
         }
         created.on(Socket.EVENT_CONNECT_ERROR) {
             mainHandler.post {
                 if (generation != connectionGeneration || socket !== created) return@post
-                socket = null
-                clearRoomFromServer()
-                created.off()
-                created.disconnect()
-                mutableConnectionStatus.value = ConnectionStatus.ERROR
-                mutableConnectionMessage.value = "Unable to connect"
-                scheduleReconnect(generation)
+                handleConnectionLoss(created, generation)
             }
         }
         created.on(Socket.EVENT_DISCONNECT) {
             mainHandler.post {
                 if (generation != connectionGeneration || socket !== created) return@post
-                socket = null
-                clearRoomFromServer()
-                mutableConnectionStatus.value = ConnectionStatus.DISCONNECTED
-                mutableConnectionMessage.value = "Disconnected"
-                scheduleReconnect(generation)
+                handleConnectionLoss(created, generation)
             }
         }
         created.connect()
     }
 
+    private fun authenticateSession(current: Socket, generation: Long) {
+        val operation = ++sessionOperation
+        sessionReady = false
+        acknowledgementJob?.cancel()
+        acknowledgementJob = viewModelScope.launch {
+            delay(3_000)
+            if (socket === current && generation == connectionGeneration && operation == sessionOperation) handleConnectionLoss(current, generation)
+        }
+        val credentials = JSONObject()
+        playerId?.let { credentials.put("playerId", it) }
+        resumeToken?.let { credentials.put("resumeToken", it) }
+        current.emit("session:open", credentials, io.socket.client.Ack { args ->
+            mainHandler.post {
+                if (socket !== current || generation != connectionGeneration || operation != sessionOperation) return@post
+                val response = args.firstOrNull() as? JSONObject ?: return@post
+                acknowledgementJob?.cancel()
+                if (!response.optBoolean("ok")) {
+                    val message = response.optString("error", "Session expired. Connect again.")
+                    endParticipation()
+                    disposeSocket(ConnectionStatus.DISCONNECTED)
+                    mutableRoomError.value = message
+                    mutableConnectionMessage.value = message
+                    return@post
+                }
+                playerId = response.optString("playerId")
+                resumeToken = response.optString("resumeToken")
+                sessionReady = true
+                reconnectAttempt = 0
+                mutableConnectionStatus.value = ConnectionStatus.CONNECTED
+                mutableConnectionMessage.value = "Connected"
+                val restoredRoom = response.optJSONObject("room")
+                if (restoredRoom != null) updateRoom(restoredRoom) else clearRoomFromServer()
+                val snapshot = response.optJSONObject("snapshot")
+                if (snapshot != null && snapshot.optString("matchId") != returnedMatchId) {
+                    if (onlineMatch.value == null) {
+                        roleForSocket()?.let { role ->
+                            cancelBot()
+                            mutableOnlineMatch.value = OnlineMatchInfo(snapshot.optString("matchId"), snapshot.optLong("questionId"), role)
+                        }
+                    }
+                    applyOnlineSnapshot(snapshot)
+                    // Receipt may be repeated if the snapshot was already applied; the server deduplicates it.
+                    if (snapshot.optString("phase") == "resuming") acknowledgeFreshQuestion(snapshot)
+                } else if (onlineMatch.value != null && state.value.phase != BattlePhase.RESULT) {
+                    clearOnlineMatch()
+                    mutableState.value = BattleState(battleId = state.value.battleId + 1)
+                    mutableRoomError.value = "Match ended"
+                }
+                acknowledgementJob = viewModelScope.launch {
+                    delay(3_000)
+                    if (socket === current && generation == connectionGeneration && operation == sessionOperation) {
+                        mutableConnectionMessage.value = "Server acknowledgement timed out"
+                    }
+                }
+                current.emit("connection:check", io.socket.client.Ack { checkArgs ->
+                    mainHandler.post {
+                        if (socket === current && generation == connectionGeneration && sessionReady && operation == sessionOperation) {
+                            acknowledgementJob?.cancel()
+                            mutableConnectionMessage.value = (checkArgs.firstOrNull() as? JSONObject)
+                                ?.optString("message", "Connected") ?: "Connected"
+                        }
+                    }
+                })
+            }
+        })
+    }
+
+    private fun handleConnectionLoss(current: Socket, generation: Long) {
+        if (socket !== current || generation != connectionGeneration) return
+        suspendOnlineMatch()
+        disposeSocket(ConnectionStatus.DISCONNECTED)
+        mutableConnectionMessage.value = "Reconnecting\u2026"
+        scheduleReconnect(connectionGeneration)
+    }
+
     private fun scheduleReconnect(generation: Long) {
-        if (!wantsConnection || !connectionForeground || generation != connectionGeneration || reconnectAttempt >= 3) return
+        if (!wantsConnection || !connectionForeground || generation != connectionGeneration) return
+        if (reconnectAttempt >= 5) {
+            if (onlineMatch.value != null && state.value.phase != BattlePhase.RESULT) {
+                mutableOnlineSubmissionStatus.value = "Connection lost. Retry connection or go Back."
+            }
+            return
+        }
         reconnectJob?.cancel()
-        val delayMs = 1_000L shl reconnectAttempt++
+        val delayMs = 1_000L
+        reconnectAttempt++
         reconnectJob = viewModelScope.launch {
             delay(delayMs)
             if (wantsConnection && connectionForeground && generation == connectionGeneration && socket == null) {
@@ -491,6 +783,8 @@ class BattleViewModel : ViewModel() {
 
     private fun disposeSocket(status: ConnectionStatus) {
         connectionGeneration++
+        sessionOperation++
+        sessionReady = false
         acknowledgementJob?.cancel()
         val old = socket
         socket = null
@@ -502,7 +796,7 @@ class BattleViewModel : ViewModel() {
 
     // Survives Activity recreation; skipped or consumed feedback is never retried.
     fun consumeFeedback(event: CombatFeedback): Boolean {
-        if (!resumed.value || state.value.key != event.token || consumedToken == event.token) return false
+        if (!resumed.value || onlinePaused.value || state.value.key != event.token || consumedToken == event.token) return false
         consumedToken = event.token
         return true
     }
@@ -551,7 +845,7 @@ class BattleViewModel : ViewModel() {
 
     private fun scheduleBotIfNeeded() {
         val current = mutableState.value
-        if (!resumed.value || current.phase != BattlePhase.ANSWERING) return
+        if (!resumed.value || mutableOnlineMatch.value != null || current.phase != BattlePhase.ANSWERING) return
         if (botJob?.isActive == true && botKey == current.key) return
 
         val capturedKey = current.key
@@ -600,28 +894,30 @@ class BattleViewModel : ViewModel() {
     fun startBattle() = edit { if (it.phase == BattlePhase.HOME) newBattle(it) else it }
     fun restartBattle() = edit { if (it.phase == BattlePhase.RESULT) newBattle(it) else it }
     fun digit(value: Int) {
+        if (onlineMatch.value != null && (onlineAnswerLocked.value || !resumed.value)) return
         if (onlineMatch.value != null) mutableState.value = enterDigit(mutableState.value, value) else edit { enterDigit(it, value) }
     }
     fun backspace() {
+        if (onlineMatch.value != null && (onlineAnswerLocked.value || !resumed.value)) return
         if (onlineMatch.value != null) mutableState.value = eraseDigit(mutableState.value) else edit(::eraseDigit)
     }
     fun clear() {
+        if (onlineMatch.value != null && (onlineAnswerLocked.value || !resumed.value)) return
         if (onlineMatch.value != null) mutableState.value = clearInput(mutableState.value) else edit(::clearInput)
     }
     fun submit() {
         if (onlineMatch.value != null) submitOnlineAnswer() else edit(::submitAnswer)
     }
     fun returnHome() {
-        if (onlineMatch.value != null) {
-            if (state.value.phase != BattlePhase.RESULT) leaveRoom() else leaveOnlineLobby()
-        } else edit { BattleState(battleId = it.battleId + 1) }
+        if (onlineMatch.value != null || state.value.phase == BattlePhase.HOME) endParticipation()
+        else edit { BattleState(battleId = it.battleId + 1) }
     }
 
     override fun onCleared() {
         cancelBot()
         wantsConnection = false
         reconnectJob?.cancel()
-        leaveRoom()
+        endParticipation()
         disposeSocket(ConnectionStatus.IDLE)
         super.onCleared()
     }

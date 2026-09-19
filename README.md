@@ -37,3 +37,9 @@ From `server/`, run `npm run start:dev`. The server listens on port 3000 by defa
 The debug Connection check also supports creating or joining one two-player local room. It only provides lobby presence in this milestone; Start Battle remains the offline bot mode.
 
 When both room members tap Ready, the server starts the first online question. Answers, HP, attacks, and results are server-authoritative; Start Battle remains the offline bot mode.
+
+## Milestone 8 reconnection
+
+An active online match pauses when the server detects a disconnected phone (heartbeat: 3-second interval, 5-second timeout). The disconnected player has 15 seconds from detection to return. Temporary private session credentials stay only in the Android ViewModel and server memory; process death and server restart recovery are not supported. Both phones must receive a fresh question before answering resumes, with committed HP preserved. Expiry awards the connected opponent a forfeit victory; if neither returns, the room is removed. Back, Leave Room, and Disconnect intentionally end participation immediately when connected.
+
+Manual checks: background/return within 15 seconds; old answers and delayed replies are ignored; disconnect during an attack preserves damage exactly once; expiry forfeits; both phones disconnect; Back/Leave skips grace; repeated retries keep one connection; rematches and offline Start Battle still work. Rebuild/install the APK on both phones and restart the server together for this protocol update.

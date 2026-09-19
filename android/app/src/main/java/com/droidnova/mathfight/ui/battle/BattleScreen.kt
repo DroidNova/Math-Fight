@@ -74,18 +74,21 @@ fun MathFightApp(
     roomError: String,
     onlineMatch: OnlineMatchInfo?,
     onlineAnswerLocked: Boolean,
+    onlineSubmissionStatus: String,
     onRoomCode: (String) -> Unit,
     onCreateRoom: () -> Unit,
     onJoinRoom: () -> Unit,
     onLeaveRoom: () -> Unit,
     onReady: () -> Unit
 ) {
-    BackHandler(enabled = state.phase != BattlePhase.HOME, onBack = onReturnHome)
+    BackHandler(enabled = state.phase != BattlePhase.HOME || room != null ||
+        connectionStatus == BattleViewModel.ConnectionStatus.CONNECTED ||
+        connectionStatus == BattleViewModel.ConnectionStatus.CONNECTING, onBack = onReturnHome)
     when (state.phase) {
         BattlePhase.HOME -> HomeScreen(onStart, settings, onSound, onVibration,
             debugConnection, serverUrl, connectionStatus, connectionMessage, onServerUrl, onConnect, onDisconnect,
             roomCodeInput, room, roomError, onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom, onReady)
-        BattlePhase.RESULT -> ResultScreen(state.winner, onRestart, onlineMatch != null)
+        BattlePhase.RESULT -> ResultScreen(state.winner, onRestart, onlineMatch != null, onlineSubmissionStatus)
         else -> BattleScreen(
             state = state,
             isResumed = isResumed,
@@ -98,7 +101,10 @@ fun MathFightApp(
             onBackspace = onBackspace,
             onClear = onClear,
             onSubmit = onSubmit
-            ,online = onlineMatch != null, onlineAnswerLocked = onlineAnswerLocked
+            ,online = onlineMatch != null, onlineAnswerLocked = onlineAnswerLocked,
+            onlineSubmissionStatus = onlineSubmissionStatus,
+            canRetry = onlineMatch != null && connectionStatus == BattleViewModel.ConnectionStatus.DISCONNECTED,
+            onRetry = onConnect
         )
     }
 }
@@ -139,7 +145,7 @@ private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
 }
 
 @Composable
-private fun ResultScreen(winner: Fighter?, onRestart: () -> Unit, online: Boolean = false) {
+private fun ResultScreen(winner: Fighter?, onRestart: () -> Unit, online: Boolean = false, message: String = "") {
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp),
@@ -150,6 +156,7 @@ private fun ResultScreen(winner: Fighter?, onRestart: () -> Unit, online: Boolea
                 if (winner == Fighter.PLAYER) "You win!" else "You lose!",
                 style = MaterialTheme.typography.displaySmall
             )
+            if (online && message.isNotBlank()) Text(message, modifier = Modifier.padding(top = 12.dp))
             Button(
                 onClick = onRestart,
                 modifier = Modifier.padding(top = 28.dp).heightIn(min = 48.dp)
@@ -174,7 +181,10 @@ private fun BattleScreen(
     onClear: () -> Unit,
     onSubmit: () -> Unit,
     online: Boolean,
-    onlineAnswerLocked: Boolean
+    onlineAnswerLocked: Boolean,
+    onlineSubmissionStatus: String,
+    canRetry: Boolean,
+    onRetry: () -> Unit
 ) {
     val controlsEnabled = isResumed && state.phase == BattlePhase.ANSWERING && (!online || !onlineAnswerLocked)
     Surface(modifier = Modifier.fillMaxSize()) {
@@ -207,6 +217,11 @@ private fun BattleScreen(
                 color = MaterialTheme.colorScheme.error,
                 style = MaterialTheme.typography.bodyMedium
             )
+            if (onlineSubmissionStatus.isNotEmpty()) {
+                Text(onlineSubmissionStatus, style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            if (canRetry) TextButton(onClick = onRetry) { Text("Retry connection") }
             Keypad(
                 enabled = controlsEnabled,
                 onDigit = onDigit,
