@@ -5,31 +5,39 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import android.view.HapticFeedbackConstants
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.setContent
+import android.view.ViewGroup
+import android.widget.FrameLayout
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.setValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.ComposeView
+import androidx.compose.ui.platform.ViewCompositionStrategy
+import androidx.fragment.app.FragmentActivity
+import androidx.fragment.app.FragmentContainerView
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.droidnova.mathfight.profile.ProfileStore
 import com.droidnova.mathfight.profile.ProfileScreen
-import com.droidnova.mathfight.game.PhaseKey
 import com.droidnova.mathfight.ui.battle.CombatAudio
 import com.droidnova.mathfight.ui.battle.FeedbackKind
+import com.droidnova.mathfight.ui.battle.arena.ActivityArenaHost
+import com.droidnova.mathfight.ui.battle.arena.ArenaHostProvider
+import com.droidnova.mathfight.ui.battle.arena.ArenaCommandBridge
+import com.droidnova.mathfight.ui.battle.arena.BattleExitCoordinator
+import com.badlogic.gdx.backends.android.AndroidFragmentApplication
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.droidnova.mathfight.ui.battle.BattleViewModel
 import com.droidnova.mathfight.ui.battle.MathFightApp
 import com.droidnova.mathfight.ui.theme.MathFightTheme
 
-class MainActivity : ComponentActivity() {
+class MainActivity : FragmentActivity(), AndroidFragmentApplication.Callbacks, ArenaHostProvider {
+    override val arenaCommandBridge = ArenaCommandBridge()
+    override lateinit var arenaHost: ActivityArenaHost
+    private lateinit var battleExitCoordinator: BattleExitCoordinator
     private val battleViewModel: BattleViewModel by viewModels {
         viewModelFactory { initializer { BattleViewModel(ProfileStore(applicationContext)) } }
     }
@@ -39,7 +47,22 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         audio = CombatAudio(this)
         enableEdgeToEdge()
-        setContent {
+        val root = FrameLayout(this)
+        val arenaContainer = FragmentContainerView(this).apply {
+            id = R.id.battle_arena_fragment_container
+        }
+        val composeView = ComposeView(this).apply {
+            setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
+        }
+        root.addView(arenaContainer, FrameLayout.LayoutParams(1, 1))
+        root.addView(composeView, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.MATCH_PARENT
+        ))
+        setContentView(root)
+        arenaHost = ActivityArenaHost(this, root, composeView, arenaContainer, arenaCommandBridge)
+        battleExitCoordinator = BattleExitCoordinator(arenaHost)
+        composeView.setContent {
             val state by battleViewModel.state.collectAsStateWithLifecycle()
             val profile by battleViewModel.profile.collectAsStateWithLifecycle()
             val isResumed by battleViewModel.isResumed.collectAsStateWithLifecycle()
@@ -62,11 +85,15 @@ class MainActivity : ComponentActivity() {
             val leaderboardOpen by battleViewModel.leaderboardOpen.collectAsStateWithLifecycle()
             val rankedResult by battleViewModel.rankedResult.collectAsStateWithLifecycle()
             val xpResult by battleViewModel.xpResult.collectAsStateWithLifecycle()
+            val exitInProgress by battleExitCoordinator.exitInProgress.collectAsStateWithLifecycle()
             val view = LocalView.current
-            var impactToken by remember { mutableStateOf<PhaseKey?>(null) }
+            LaunchedEffect(state.battleId, state.phase) {
+                if (state.phase != com.droidnova.mathfight.game.BattlePhase.HOME) {
+                    battleExitCoordinator.beginBattle(state.battleId)
+                }
+            }
             LaunchedEffect(onlinePaused) {
                 if (onlinePaused) {
-                    impactToken = null
                     audio.stop()
                 }
             }
@@ -79,14 +106,12 @@ class MainActivity : ComponentActivity() {
                             val currentSettings = battleViewModel.settings.value
                             if (currentSettings.sound) audio.play(event.kind)
                             if (event.kind == FeedbackKind.HIT) {
-                                impactToken = event.token
                                 if (currentSettings.vibration) {
                                     view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
                                 }
                             }
                         }
                     } finally {
-                        impactToken = null
                         audio.stop()
                     }
                 }
@@ -113,9 +138,10 @@ class MainActivity : ComponentActivity() {
                     difficulty = difficulty,
                     onDifficulty = battleViewModel::setDifficulty,
                     state = state,
+                    exitInProgress = exitInProgress,
                     isResumed = isResumed,
-                    impactToken = impactToken,
-                    consumeImpact = battleViewModel::consumeImpact,
+                    onlinePaused = onlinePaused,
+                    consumeVisualEvent = battleViewModel::consumeArenaVisualEvent,
                     settings = settings,
                     debugConnection = (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0,
                     serverUrl = serverUrl,
@@ -145,13 +171,23 @@ class MainActivity : ComponentActivity() {
                     onStart = battleViewModel::startBattle,
                     onRestart = {
                         audio.stop()
-                        if (onlineMatch != null) battleViewModel.leaveOnlineLobby() else battleViewModel.restartBattle()
+                        if (onlineMatch != null) {
+                            battleExitCoordinator.exit {
+                                if (rankedResult.ranked) battleViewModel.findNewOpponent()
+                                else battleViewModel.leaveOnlineLobby()
+                            }
+                        } else {
+                            battleExitCoordinator.restart(battleViewModel::restartBattle)
+                        }
                     },
-                    onFindNewOpponent = battleViewModel::findNewOpponent,
                     onDigit = battleViewModel::digit,
                     onBackspace = battleViewModel::backspace,
                     onClear = battleViewModel::clear,
                     onSubmit = battleViewModel::submit,
+                    onBattleExit = {
+                        audio.stop()
+                        battleExitCoordinator.exit(battleViewModel::returnHome)
+                    },
                     onReturnHome = { audio.stop(); battleViewModel.returnHome() }
                 )
                 }
@@ -183,7 +219,11 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         audio.release()
         super.onDestroy()
+        arenaHost.destroy()
+        arenaCommandBridge.dispose()
     }
+
+    override fun exit() = Unit
 
     private fun requestConnection() {
         if (Build.VERSION.SDK_INT >= 37 &&

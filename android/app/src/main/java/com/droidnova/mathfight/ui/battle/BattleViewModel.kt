@@ -149,7 +149,10 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     val feedback = mutableFeedback.asSharedFlow()
     private var emittedToken: PhaseKey? = null
     private var consumedToken: PhaseKey? = null
-    private var consumedImpact: PhaseKey? = null
+    private var arenaEncounter: String? = null
+    private var consumedArenaAttack: PhaseKey? = null
+    private var consumedArenaHit: PhaseKey? = null
+    private var consumedArenaKo: PhaseKey? = null
 
     enum class ConnectionStatus { IDLE, CONNECTING, CONNECTED, DISCONNECTED, ERROR }
     private val mutableServerUrl = MutableStateFlow("http://192.168.1.7:3000")
@@ -458,11 +461,34 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         return ClockSample(roundTrip, serverTime - roundTrip / 2L, midpoint)
     }
 
-    fun consumeImpact(token: PhaseKey): Boolean {
-        if (!resumed.value || state.value.key != token || token.phase != BattlePhase.IMPACT ||
-            consumedToken != token || consumedImpact == token) return false
-        consumedImpact = token
-        return true
+    /**
+     * One-shot presentation gate that survives Activity recreation with this ViewModel. The arena
+     * cannot replay a phase just because Compose or its libGDX fragment was recreated.
+     */
+    fun consumeArenaVisualEvent(token: PhaseKey): Boolean {
+        if (!resumed.value || onlinePaused.value || state.value.key != token) return false
+        val encounter = onlineMatch.value?.matchId ?: "offline:${token.battleId}"
+        if (arenaEncounter != encounter) {
+            arenaEncounter = encounter
+            consumedArenaAttack = null
+            consumedArenaHit = null
+            consumedArenaKo = null
+        }
+        return when (token.phase) {
+            BattlePhase.WINDUP -> if (consumedArenaAttack == token) false else {
+                consumedArenaAttack = token
+                true
+            }
+            BattlePhase.IMPACT -> if (consumedArenaHit == token) false else {
+                consumedArenaHit = token
+                true
+            }
+            BattlePhase.KO -> if (consumedArenaKo == token) false else {
+                consumedArenaKo = token
+                true
+            }
+            else -> false
+        }
     }
 
     fun setSound(enabled: Boolean) { mutableSettings.value = settings.value.copy(sound = enabled) }
