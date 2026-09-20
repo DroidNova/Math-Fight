@@ -111,6 +111,9 @@ private data class ActiveQuestionWindow(
     val closesAt: Long
 )
 private class ProfileSyncFailure(message: String) : Exception(message)
+private enum class RetryScope {
+    CONNECTION, PROFILE, ACCOUNT_READ, ROOM_ENTRY, ROOM_CONTROL, MATCHMAKING, ANSWER, MATCH_STATE, TIME_SYNC
+}
 
 class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     private var localProfile: LocalProfile? = null
@@ -122,6 +125,8 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     val leaderboard = mutableLeaderboard.asStateFlow()
     private val mutableLeaderboardOpen = MutableStateFlow(false)
     val leaderboardOpen = mutableLeaderboardOpen.asStateFlow()
+    private var leaderboardRequest = 0L
+    private var leaderboardTimeout: Job? = null
     private val mutableRankedResult = MutableStateFlow(RankedResult())
     val rankedResult = mutableRankedResult.asStateFlow()
     private val mutableXpResult = MutableStateFlow<XpResult?>(null)
@@ -165,7 +170,8 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     private var reconnectJob: Job? = null
     private var acknowledgementJob: Job? = null
     private var reconnectAttempt = 0
-    private var serverRetryUntilElapsedMs = 0L
+    private var disconnectMessageAfterDispose: String? = null
+    private val retryUntilElapsedMs = mutableMapOf<RetryScope, Long>()
     private val mainHandler = Handler(Looper.getMainLooper())
     private val mutableRoomCodeInput = MutableStateFlow("")
     val roomCodeInput = mutableRoomCodeInput.asStateFlow()
@@ -176,8 +182,11 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     private val mutableSearch = MutableStateFlow(MatchSearchState())
     val search = mutableSearch.asStateFlow()
     private var completedSearchId: String? = null
+    private var searchOperationGeneration = 0L
+    private var cancelSearchWhenIdentified = false
     private var roomOperationGeneration = 0L
     private var roomRequestPending = false
+    private var roomRequestTimeout: Job? = null
     private val mutableOnlineMatch = MutableStateFlow<OnlineMatchInfo?>(null)
     val onlineMatch = mutableOnlineMatch.asStateFlow()
     private val mutableOnlineAnswerLocked = MutableStateFlow(false)
@@ -242,16 +251,30 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     fun closeLeaderboard() { mutableLeaderboardOpen.value = false }
 
     private fun fetchLeaderboard() {
-        if (retryBlocked { mutableLeaderboard.value = LeaderboardState(connected = true, error = it) }) return
+        val request = ++leaderboardRequest
+        val generation = connectionGeneration
+        val operation = sessionOperation
+        leaderboardTimeout?.cancel()
+        if (retryBlocked(RetryScope.ACCOUNT_READ) { mutableLeaderboard.value = LeaderboardState(connected = true, error = it) }) return
         val current = socket
         if (current?.connected() != true || !sessionReady) { mutableLeaderboard.value = LeaderboardState(connected = false, error = "Connect to the server to view the leaderboard"); return }
         mutableLeaderboard.value = LeaderboardState(loading = true, connected = true)
+        leaderboardTimeout = viewModelScope.launch {
+            delay(5_000)
+            if (request == leaderboardRequest) {
+                leaderboardRequest++
+                mutableLeaderboard.value = LeaderboardState(connected = true, error = "Leaderboard unavailable")
+            }
+        }
         current.emit("leaderboard:get", JSONObject(), io.socket.client.Ack { args ->
             mainHandler.post {
+                if (request != leaderboardRequest || generation != connectionGeneration || operation != sessionOperation ||
+                    socket !== current || !sessionReady) return@post
+                leaderboardTimeout?.cancel()
                 val response = args.firstOrNull() as? JSONObject
-                if (socket !== current || response?.optBoolean("ok") != true) {
+                if (response?.optBoolean("ok") != true) {
                     mutableLeaderboard.value = LeaderboardState(connected = true,
-                        error = response?.let { serverErrorMessage(it, "Leaderboard unavailable") } ?: "Leaderboard unavailable")
+                        error = response?.let { serverErrorMessage(it, "Leaderboard unavailable", RetryScope.ACCOUNT_READ) } ?: "Leaderboard unavailable")
                     return@post
                 }
                 val rows = mutableListOf<LeaderboardRow>(); val values = response.optJSONArray("players")
@@ -325,7 +348,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         val operation = sessionOperation
         profileStatsTimeout?.cancel()
         val current = socket
-        if (retryBlocked { mutableProfile.value = profile.value.copy(statsLoading = false, stats = null) }) return
+        if (retryBlocked(RetryScope.ACCOUNT_READ) { mutableProfile.value = profile.value.copy(statsLoading = false, stats = null) }) return
         if (current?.connected() != true || !sessionReady) {
             mutableProfile.value = profile.value.copy(statsLoading = false, stats = null)
             return
@@ -344,7 +367,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                 profileStatsTimeout?.cancel()
                 val response = args.firstOrNull() as? JSONObject
                 if (response?.optBoolean("ok") != true) {
-                    if (response != null) serverErrorMessage(response, "Statistics unavailable")
+                    if (response != null) serverErrorMessage(response, "Statistics unavailable", RetryScope.ACCOUNT_READ)
                     mutableProfile.value = profile.value.copy(statsLoading = false, stats = null)
                     return@post
                 }
@@ -363,7 +386,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         val generation = connectionGeneration
         val operation = sessionOperation
         if (socket !== current || !current.connected()) throw ProfileSyncFailure("Connection changed. Try again.")
-        if (retryDelayRemaining() > 0L) throw ProfileSyncFailure("Too many attempts. Try again shortly.")
+        if (retryDelayRemaining(RetryScope.PROFILE) > 0L) throw ProfileSyncFailure("Too many attempts. Try again shortly.")
         val accountToken = profileStore.loadAccountToken()
         val response = withTimeout(3_000) {
             suspendCancellableCoroutine<JSONObject> { continuation ->
@@ -376,7 +399,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
             }
         }
         if (socket !== current || generation != connectionGeneration || operation != sessionOperation) throw ProfileSyncFailure("Connection changed. Try again.")
-        if (!response.optBoolean("ok")) throw ProfileSyncFailure(serverErrorMessage(response, "Profile was not accepted"))
+        if (!response.optBoolean("ok")) throw ProfileSyncFailure(serverErrorMessage(response, "Profile was not accepted", RetryScope.PROFILE))
         if (normalizedPlayerName(response.optString("displayName")) == null) throw ProfileSyncFailure("Invalid profile acknowledgement")
         response.optString("accountToken").takeIf { it.isNotBlank() }?.let { profileStore.saveAccountToken(it) }
         return response
@@ -388,15 +411,22 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         refreshQuestionCountdown()
         refreshPauseCountdown()
         clockSyncJob = viewModelScope.launch {
-            val samples = mutableListOf<ClockSample>()
-            repeat(3) {
-                takeTimeSample(current, generation, operation)?.let(samples::add)
-            }
-            if (socket !== current || generation != connectionGeneration || operation != sessionOperation || !sessionReady) return@launch
-            samples.minByOrNull { it.roundTripMs }?.let { best ->
-                serverClock = ServerClockMapping(best.serverEpochAtMidpointMs, best.localMidpointMs)
-                refreshQuestionCountdown()
-                refreshPauseCountdown()
+            var retryDelay = 1_000L
+            while (socket === current && generation == connectionGeneration && operation == sessionOperation && sessionReady) {
+                val samples = mutableListOf<ClockSample>()
+                for (sample in 0 until 3) {
+                    if (retryDelayRemaining(RetryScope.TIME_SYNC) > 0L) break
+                    takeTimeSample(current, generation, operation)?.let(samples::add)
+                }
+                val best = samples.minByOrNull { it.roundTripMs }
+                if (best != null) {
+                    serverClock = ServerClockMapping(best.serverEpochAtMidpointMs, best.localMidpointMs)
+                    refreshQuestionCountdown()
+                    refreshPauseCountdown()
+                    return@launch
+                }
+                delay(maxOf(retryDelay, retryDelayRemaining(RetryScope.TIME_SYNC)))
+                retryDelay = (retryDelay * 2L).coerceAtMost(30_000L)
             }
         }
     }
@@ -418,13 +448,14 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         }
         if (socket !== current || generation != connectionGeneration || operation != sessionOperation || !sessionReady) return null
         if (!response.first.optBoolean("ok")) {
-            serverErrorMessage(response.first, "Time synchronization unavailable")
+            serverErrorMessage(response.first, "Time synchronization unavailable", RetryScope.TIME_SYNC)
             return null
         }
         val serverTime = response.first.optLong("serverTime", -1L)
         if (serverTime <= 0L || response.second < started) return null
-        val midpoint = started + (response.second - started) / 2L
-        return ClockSample(response.second - started, serverTime, midpoint)
+        val roundTrip = response.second - started
+        val midpoint = started + roundTrip / 2L
+        return ClockSample(roundTrip, serverTime - roundTrip / 2L, midpoint)
     }
 
     fun consumeImpact(token: PhaseKey): Boolean {
@@ -438,7 +469,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     fun setVibration(enabled: Boolean) { mutableSettings.value = settings.value.copy(vibration = enabled) }
 
     fun readyToggle() {
-        if (retryBlocked(::setRoomError)) return
+        if (retryBlocked(RetryScope.ROOM_CONTROL, ::setRoomError)) return
         val current = socket ?: return setRoomError("Connect to the server first")
         if (!sessionReady || !current.connected()) return
         val currentRoom = room.value ?: return setRoomError("Join a room first")
@@ -448,21 +479,21 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
             mainHandler.post {
                 if (socket !== current || !sessionReady || operation != roomOperationGeneration || args.isEmpty() || args[0] !is JSONObject) return@post
                 val response = args[0] as JSONObject
-                if (!response.optBoolean("ok", false)) setRoomError(serverErrorMessage(response, "Ready request failed"))
+                if (!response.optBoolean("ok", false)) setRoomError(serverErrorMessage(response, "Ready request failed", RetryScope.ROOM_CONTROL))
             }
         })
     }
 
     fun setRoomDifficulty(value: Difficulty) {
-        if (retryBlocked(::setRoomError)) return
+        if (retryBlocked(RetryScope.ROOM_CONTROL, ::setRoomError)) return
         val current = socket ?: return
         val currentRoom = room.value ?: return
-        if (!currentRoom.role.equals("Host", true) || currentRoom.matchActive || !sessionReady) return
+        if (currentRoom.ranked || !currentRoom.role.equals("Host", true) || currentRoom.matchActive || !sessionReady) return
         current.emit("room:difficulty", JSONObject().put("difficulty", value.name), io.socket.client.Ack { args ->
             mainHandler.post {
                 if (socket !== current || args.firstOrNull() !is JSONObject) return@post
                 val response = args[0] as JSONObject
-                if (!response.optBoolean("ok")) setRoomError(serverErrorMessage(response, "Difficulty change failed"))
+                if (!response.optBoolean("ok")) setRoomError(serverErrorMessage(response, "Difficulty change failed", RetryScope.ROOM_CONTROL))
             }
         })
     }
@@ -470,7 +501,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     fun setServerUrl(value: String) {
         if (value == mutableServerUrl.value) return
         mutableServerUrl.value = value
-        serverRetryUntilElapsedMs = 0L
+        retryUntilElapsedMs.clear()
         endParticipation()
     }
 
@@ -495,63 +526,94 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     }
 
     fun setRoomCodeInput(value: String) {
-        mutableRoomCodeInput.value = value.uppercase().filter { it.isLetterOrDigit() }.take(6)
+        mutableRoomCodeInput.value = value.uppercase().filter { it in 'A'..'Z' || it in '0'..'9' }.take(6)
         mutableRoomError.value = ""
     }
 
     fun findMatch() {
-        if (retryBlocked(::setSearchError)) return
+        if (retryBlocked(RetryScope.MATCHMAKING, ::setSearchError)) return
         val current = socket
         if (!sessionReady || current?.connected() != true) return setSearchError("Connect to the server first")
         if (room.value != null || onlineMatch.value != null) return setSearchError("Leave the current room first")
         if (search.value.active) return
+        val operation = ++searchOperationGeneration
         completedSearchId = null
+        cancelSearchWhenIdentified = false
         mutableSearch.value = MatchSearchState(active = true, status = "waiting", difficulty = difficulty.value)
         current.emit("matchmaking:join", JSONObject().put("difficulty", difficulty.value.name), io.socket.client.Ack { args ->
             mainHandler.post {
-                if (socket !== current || args.firstOrNull() !is JSONObject) return@post
+                if (socket !== current || operation != searchOperationGeneration || room.value != null ||
+                    !search.value.active || args.firstOrNull() !is JSONObject) return@post
                 val response = args[0] as JSONObject
                 if (!response.optBoolean("ok")) {
-                    mutableSearch.value = MatchSearchState(error = serverErrorMessage(response, "Matchmaking failed"))
+                    setSearchError(serverErrorMessage(response, "Matchmaking failed", RetryScope.MATCHMAKING))
                 } else {
                     val id = response.optString("searchId")
-                    if (id.isNotBlank()) mutableSearch.value = search.value.copy(active = true, searchId = id, status = "waiting", difficulty = parseDifficulty(response.optString("difficulty")), error = "")
+                    if (id.isNotBlank()) {
+                        if (search.value.status == "cancelling" && search.value.searchId == id) return@post
+                        mutableSearch.value = search.value.copy(active = true, searchId = id, status = "waiting",
+                            difficulty = parseDifficulty(response.optString("difficulty")), error = "")
+                        if (cancelSearchWhenIdentified) cancelMatch()
+                    }
                 }
             }
         })
     }
 
     fun cancelMatch() {
-        if (retryBlocked(::setSearchError)) return
+        if (room.value != null) return clearSearch()
+        if (retryBlocked(RetryScope.MATCHMAKING, ::setSearchError)) return
         val current = socket ?: return clearSearch()
         val id = search.value.searchId
-        if (id.isBlank()) return clearSearch()
+        if (id.isBlank()) {
+            cancelSearchWhenIdentified = true
+            mutableSearch.value = search.value.copy(status = "cancelling")
+            return
+        }
+        if (search.value.status == "cancelling" && !cancelSearchWhenIdentified) return
+        cancelSearchWhenIdentified = false
+        mutableSearch.value = search.value.copy(status = "cancelling")
+        val operation = searchOperationGeneration
         current.emit("matchmaking:cancel", JSONObject().put("searchId", id), io.socket.client.Ack { args ->
             mainHandler.post {
-                if (socket !== current || search.value.searchId != id) return@post
+                if (socket !== current || operation != searchOperationGeneration || room.value != null || search.value.searchId != id) return@post
                 val response = args.firstOrNull() as? JSONObject
-                if (response?.optBoolean("ok") == true) clearSearch()
-                else mutableSearch.value = search.value.copy(error = response?.let { serverErrorMessage(it, "Could not cancel search") } ?: "Could not cancel search")
+                if (response?.optBoolean("ok") == true && response.optString("status") == "matched") {
+                    mutableSearch.value = search.value.copy(active = true, status = "matched")
+                } else if (response?.optBoolean("ok") == true) clearSearch()
+                else mutableSearch.value = search.value.copy(status = "waiting",
+                    error = response?.let { serverErrorMessage(it, "Could not cancel search", RetryScope.MATCHMAKING) } ?: "Could not cancel search")
             }
         })
     }
 
     private fun setSearchError(message: String) {
+        searchOperationGeneration++
+        cancelSearchWhenIdentified = false
         mutableSearch.value = MatchSearchState(error = message)
     }
 
     private fun parseDifficulty(value: String): Difficulty = runCatching { Difficulty.valueOf(value) }.getOrDefault(Difficulty.STANDARD)
 
-    private fun clearSearch() { mutableSearch.value = MatchSearchState() }
+    private fun clearSearch() {
+        searchOperationGeneration++
+        cancelSearchWhenIdentified = false
+        mutableSearch.value = MatchSearchState()
+    }
 
     private fun handleSearchStatus(value: JSONObject) {
         val id = value.optString("searchId")
         if (id == completedSearchId || room.value != null) return
+        if (!search.value.active) return
         if (id.isBlank() || id != search.value.searchId && search.value.searchId.isNotBlank()) return
         when (value.optString("status")) {
-            "waiting" -> mutableSearch.value = search.value.copy(active = true, searchId = id, status = "waiting",
-                difficulty = parseDifficulty(value.optString("difficulty")))
+            "waiting" -> {
+                mutableSearch.value = search.value.copy(active = true, searchId = id, status = "waiting",
+                    difficulty = parseDifficulty(value.optString("difficulty")))
+                if (cancelSearchWhenIdentified) cancelMatch()
+            }
             "cancelled", "idle" -> clearSearch()
+            "expired" -> setSearchError("Search expired. Try again.")
         }
     }
 
@@ -560,18 +622,17 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         if (!search.value.active || (search.value.searchId.isNotBlank() && search.value.searchId != id)) return
         val roomValue = value.optJSONObject("room") ?: return
         completedSearchId = id
-        mutableSearch.value = search.value.copy(active = false, status = "matched", opponentName = value.optString("opponentName"))
         updateRoom(roomValue)
-        clearSearch()
     }
 
     fun createRoom() {
-        if (retryBlocked(::setRoomError)) return
+        if (retryBlocked(RetryScope.ROOM_ENTRY, ::setRoomError)) return
         if (search.value.active) return setRoomError("Cancel the current search first")
+        if (roomRequestPending) return
         val current = socket
         if (!sessionReady || current?.connected() != true) return setRoomError("Connect to the server first")
         val operation = ++roomOperationGeneration
-        roomRequestPending = true
+        beginRoomRequest(operation)
         current.emit("room:create", JSONObject().put("difficulty", difficulty.value.name), io.socket.client.Ack { args ->
             mainHandler.post {
                 if (socket !== current || operation != roomOperationGeneration || args.isEmpty() || args[0] !is JSONObject) return@post
@@ -581,14 +642,15 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     }
 
     fun joinRoom() {
-        if (retryBlocked(::setRoomError)) return
+        if (retryBlocked(RetryScope.ROOM_ENTRY, ::setRoomError)) return
         if (search.value.active) return setRoomError("Cancel the current search first")
+        if (roomRequestPending) return
         val code = roomCodeInput.value
         if (code.length != 6) return setRoomError("Enter a 6-character room code")
         val current = socket
         if (!sessionReady || current?.connected() != true) return setRoomError("Connect to the server first")
         val operation = ++roomOperationGeneration
-        roomRequestPending = true
+        beginRoomRequest(operation)
         current.emit("room:join", JSONObject().put("code", code), io.socket.client.Ack { args ->
             mainHandler.post {
                 if (socket !== current || operation != roomOperationGeneration || args.isEmpty() || args[0] !is JSONObject) return@post
@@ -599,7 +661,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
 
     fun submitOnlineAnswer() {
         val match = onlineMatch.value ?: return
-        if (retryBlocked { mutableOnlineSubmissionStatus.value = it }) return
+        if (retryBlocked(RetryScope.ANSWER) { mutableOnlineSubmissionStatus.value = it }) return
         if (mutableState.value.phase != BattlePhase.ANSWERING || mutableOnlineAnswerLocked.value ||
             mutableState.value.input.isEmpty() || !isCurrentQuestionOpen()) return
         val current = socket
@@ -632,11 +694,11 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                 answerTimeoutJob?.cancel()
                 mutableOnlineSubmissionStatus.value = ""
                 if (securityFailure) {
-                    mutableOnlineSubmissionStatus.value = serverErrorMessage(response, "Invalid request.")
+                    mutableOnlineSubmissionStatus.value = serverErrorMessage(response, "Invalid request.", RetryScope.ANSWER)
                     mutableOnlineAnswerLocked.value = true
                     if (securityCode == "RATE_LIMITED") {
                         answerTimeoutJob = viewModelScope.launch {
-                            delay(retryDelayRemaining())
+                            delay(retryDelayRemaining(RetryScope.ANSWER))
                             if (mutableOnlineMatch.value == match && isCurrentQuestionOpen() && !onlinePaused.value) {
                                 mutableOnlineSubmissionStatus.value = ""
                                 mutableOnlineAnswerLocked.value = false
@@ -690,8 +752,8 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     fun leaveOnlineLobby() {
         returnedMatchId = onlineMatch.value?.matchId
         if (room.value?.ranked == true) {
-            socket?.emit("room:leave", JSONObject())
-            mutableRoom.value = null
+            endParticipation(keepConnection = true)
+            return
         }
         clearOnlineMatch()
         mutableState.value = BattleState(phase = BattlePhase.HOME, battleId = mutableState.value.battleId + 1)
@@ -747,10 +809,10 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                 } else {
                     clearPendingAnswer()
                     mutableOnlineAnswerLocked.value = true
-                    mutableOnlineSubmissionStatus.value = serverErrorMessage(response, "Server temporarily unavailable.")
+                    mutableOnlineSubmissionStatus.value = serverErrorMessage(response, "Server temporarily unavailable.", RetryScope.MATCH_STATE)
                     if (response.optString("code") == "RATE_LIMITED") {
                         answerTimeoutJob = viewModelScope.launch {
-                            delay(retryDelayRemaining())
+                            delay(retryDelayRemaining(RetryScope.MATCH_STATE))
                             if (onlineMatch.value?.matchId == matchId && isCurrentQuestionOpen() && !onlinePaused.value) {
                                 mutableOnlineSubmissionStatus.value = ""
                                 mutableOnlineAnswerLocked.value = false
@@ -795,6 +857,8 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     private fun suspendOnlineMatch() {
         roomOperationGeneration++
         roomRequestPending = false
+        roomRequestTimeout?.cancel()
+        roomRequestTimeout = null
         if (onlineMatch.value == null) return
         clearPendingAnswer()
         onlineResolutionJob?.cancel()
@@ -821,6 +885,8 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         val sessionRequest = ++sessionOperation
         roomOperationGeneration++
         roomRequestPending = false
+        roomRequestTimeout?.cancel()
+        roomRequestTimeout = null
         clearSearch()
         val current = socket
         val generation = connectionGeneration
@@ -846,7 +912,10 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
             // Give the intentional leave packet time to reach the server before closing transport.
             acknowledgementJob = viewModelScope.launch {
                 delay(3_000)
-                if (socket === current && connectionGeneration == generation) disposeSocket(ConnectionStatus.DISCONNECTED)
+                if (socket === current && connectionGeneration == generation) {
+                    disposeSocket(ConnectionStatus.DISCONNECTED)
+                    if (keep && wantsConnection && connectionForeground) openSocket(serverUrl.value.trim().trimEnd('/'))
+                }
             }
             current.emit("session:leave", JSONObject(), io.socket.client.Ack {
                 mainHandler.post {
@@ -861,12 +930,14 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
 
     private fun setRoomError(message: String) { mutableRoomError.value = message }
 
-    private fun serverErrorMessage(response: JSONObject, fallback: String): String {
-        if (response.optString("code") == "RATE_LIMITED") {
+    private fun serverErrorMessage(response: JSONObject, fallback: String, retryScope: RetryScope? = null): String {
+        val code = response.optString("code")
+        if (code == "RATE_LIMITED" && retryScope != null) {
             val retryAfter = response.optLong("retryAfterMs", 1_000L).coerceIn(0L, 60L * 60_000L)
-            serverRetryUntilElapsedMs = maxOf(serverRetryUntilElapsedMs, SystemClock.elapsedRealtime() + retryAfter)
+            retryUntilElapsedMs[retryScope] = maxOf(retryUntilElapsedMs[retryScope] ?: 0L,
+                SystemClock.elapsedRealtime() + retryAfter)
         }
-        return when (response.optString("code")) {
+        val message = when (code) {
             "RATE_LIMITED" -> "Too many attempts. Try again shortly."
             "AUTH_REQUIRED", "SESSION_EXPIRED" -> "Session expired. Reconnect."
             "INVALID_PAYLOAD" -> "Invalid request."
@@ -882,22 +953,44 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
             "MATCH_UNAVAILABLE" -> "Match unavailable."
             else -> fallback
         }
+        if ((code == "AUTH_REQUIRED" || code == "SESSION_EXPIRED") && sessionReady) {
+            disconnectMessageAfterDispose = message
+            endParticipation()
+            mutableConnectionMessage.value = message
+            mutableRoomError.value = message
+            mutableOnlineSubmissionStatus.value = message
+        }
+        return message
     }
 
-    private fun retryDelayRemaining(): Long =
-        (serverRetryUntilElapsedMs - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+    private fun retryDelayRemaining(scope: RetryScope): Long =
+        ((retryUntilElapsedMs[scope] ?: 0L) - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
 
-    private fun retryBlocked(onBlocked: (String) -> Unit): Boolean {
-        if (retryDelayRemaining() <= 0L) return false
+    private fun retryBlocked(scope: RetryScope, onBlocked: (String) -> Unit): Boolean {
+        if (retryDelayRemaining(scope) <= 0L) return false
         onBlocked("Too many attempts. Try again shortly.")
         return true
     }
 
+    private fun beginRoomRequest(operation: Long) {
+        roomRequestPending = true
+        roomRequestTimeout?.cancel()
+        roomRequestTimeout = viewModelScope.launch {
+            delay(5_000)
+            if (operation == roomOperationGeneration && roomRequestPending) {
+                roomRequestPending = false
+                setRoomError("Room request timed out. Try again.")
+            }
+        }
+    }
+
     private fun handleRoomAck(response: JSONObject, operation: Long) {
         if (operation != roomOperationGeneration) return
+        roomRequestTimeout?.cancel()
+        roomRequestTimeout = null
         if (!response.optBoolean("ok", false)) {
             roomRequestPending = false
-            setRoomError(serverErrorMessage(response, "Room request failed"))
+            setRoomError(serverErrorMessage(response, "Room request failed", RetryScope.ROOM_ENTRY))
             return
         }
         roomRequestPending = false
@@ -905,6 +998,9 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     }
 
     private fun updateRoom(value: JSONObject) {
+        roomRequestPending = false
+        roomRequestTimeout?.cancel()
+        roomRequestTimeout = null
         val roomDifficulty = parseDifficulty(value.optString("difficulty"))
         mutableRoom.value = RoomInfo(
             value.optString("code"),
@@ -924,11 +1020,14 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         )
         mutableDifficulty.value = roomDifficulty
         mutableRoomError.value = ""
+        if (search.value.active || search.value.status != "idle") clearSearch()
     }
 
     private fun clearRoomFromServer(message: String? = null) {
         roomOperationGeneration++
         roomRequestPending = false
+        roomRequestTimeout?.cancel()
+        roomRequestTimeout = null
         mutableRoom.value = null
         mutableRoomCodeInput.value = ""
         if (!message.isNullOrBlank()) mutableRoomError.value = message
@@ -1372,7 +1471,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         }
         val created = try { IO.socket(url, options) } catch (error: Exception) {
             mutableConnectionStatus.value = ConnectionStatus.ERROR
-            mutableConnectionMessage.value = error.message ?: "Invalid server URL"
+            mutableConnectionMessage.value = "Invalid server URL"
             return
         }
         socket = created
@@ -1380,7 +1479,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
             mainHandler.post {
                 if (generation != connectionGeneration || socket !== created) return@post
                 val response = args.firstOrNull() as? JSONObject ?: return@post
-                mutableConnectionMessage.value = serverErrorMessage(response, "Server temporarily unavailable.")
+                mutableConnectionMessage.value = serverErrorMessage(response, "Server temporarily unavailable.", RetryScope.CONNECTION)
                 clearPendingAnswer()
             }
         }
@@ -1399,8 +1498,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         }
         created.on("room:state") { args ->
             mainHandler.post {
-                if (generation != connectionGeneration || socket !== created || !sessionReady ||
-                    (!roomRequestPending && mutableRoom.value == null && !search.value.active)) return@post
+                if (generation != connectionGeneration || socket !== created || !sessionReady) return@post
                 if (args.isNotEmpty() && args[0] is JSONObject) {
                     updateRoom(args[0] as JSONObject)
                     // Room state is authoritative after pairing; clear any late or filtered search event.
@@ -1504,7 +1602,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                 val response = args.firstOrNull() as? JSONObject ?: return@post
                 acknowledgementJob?.cancel()
                 if (!response.optBoolean("ok")) {
-                    val message = serverErrorMessage(response, "Session expired. Reconnect.")
+                    val message = serverErrorMessage(response, "Session expired. Reconnect.", RetryScope.CONNECTION)
                     endParticipation()
                     disposeSocket(ConnectionStatus.DISCONNECTED)
                     mutableRoomError.value = message
@@ -1523,6 +1621,8 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                         if (socket !== current || generation != connectionGeneration || operation != sessionOperation) return@launch
                         mutableConnectionStatus.value = ConnectionStatus.CONNECTED
                         mutableConnectionMessage.value = "Connected"
+                        if (profile.value.showing) fetchProfileStats()
+                        if (leaderboardOpen.value) fetchLeaderboard()
                         checkServerConnection(current, generation, operation)
                     } catch (_: TimeoutCancellationException) {
                         handleConnectionLoss(current, generation)
@@ -1556,9 +1656,6 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                 }
             }
             applyOnlineSnapshot(snapshot)
-            // Receipt may be repeated if the snapshot was already applied; the server deduplicates it.
-            if (snapshot.optString("phase").uppercase() == "SCHEDULED" &&
-                snapshot.optString("scheduleReason").uppercase() == "RESUME") acknowledgeFreshQuestion(snapshot)
         } else if (onlineMatch.value != null && state.value.phase != BattlePhase.RESULT) {
             clearOnlineMatch()
             mutableState.value = BattleState(battleId = state.value.battleId + 1)
@@ -1581,7 +1678,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                     mutableConnectionMessage.value = when {
                         response == null -> "Server temporarily unavailable."
                         response.optBoolean("ok") -> response.optString("message", "Connected")
-                        else -> serverErrorMessage(response, "Server temporarily unavailable.")
+                        else -> serverErrorMessage(response, "Server temporarily unavailable.", RetryScope.CONNECTION)
                     }
                 }
             }
@@ -1593,7 +1690,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         clearSearch()
         suspendOnlineMatch()
         disposeSocket(ConnectionStatus.DISCONNECTED)
-        mutableConnectionMessage.value = if (retryDelayRemaining() > 0L) "Too many attempts. Try again shortly." else "Reconnecting\u2026"
+        mutableConnectionMessage.value = if (retryDelayRemaining(RetryScope.CONNECTION) > 0L) "Too many attempts. Try again shortly." else "Reconnecting\u2026"
         scheduleReconnect(connectionGeneration)
     }
 
@@ -1606,7 +1703,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
             return
         }
         reconnectJob?.cancel()
-        val delayMs = maxOf(1_000L, retryDelayRemaining())
+        val delayMs = maxOf(1_000L, retryDelayRemaining(RetryScope.CONNECTION))
         reconnectAttempt++
         reconnectJob = viewModelScope.launch {
             delay(delayMs)
@@ -1620,6 +1717,14 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         profileStatsRequest++
         profileStatsTimeout?.cancel()
         mutableProfile.value = profile.value.copy(statsLoading = false, stats = null)
+        leaderboardRequest++
+        leaderboardTimeout?.cancel()
+        leaderboardTimeout = null
+        mutableLeaderboard.value = LeaderboardState(connected = false,
+            error = if (leaderboardOpen.value) "Connect to the server to view the leaderboard" else "")
+        roomRequestPending = false
+        roomRequestTimeout?.cancel()
+        roomRequestTimeout = null
         clockSyncJob?.cancel()
         clockSyncJob = null
         serverClock = null
@@ -1632,7 +1737,8 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         old?.off()
         old?.disconnect()
         mutableConnectionStatus.value = status
-        if (status != ConnectionStatus.ERROR) mutableConnectionMessage.value = ""
+        if (status != ConnectionStatus.ERROR) mutableConnectionMessage.value = disconnectMessageAfterDispose.orEmpty()
+        disconnectMessageAfterDispose = null
     }
 
     // Survives Activity recreation; skipped or consumed feedback is never retried.
@@ -1733,7 +1839,10 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         if (resumed.value) updateState(transform(mutableState.value))
     }
 
-    fun startBattle() = edit { if (it.phase == BattlePhase.HOME) newBattle(it, difficulty.value) else it }
+    fun startBattle() {
+        if (room.value != null || search.value.active || onlineMatch.value != null) return
+        edit { if (it.phase == BattlePhase.HOME) newBattle(it, difficulty.value) else it }
+    }
     fun restartBattle() = edit { if (it.phase == BattlePhase.RESULT) newBattle(it, difficulty.value) else it }
     fun digit(value: Int) {
         if (onlineMatch.value != null && (onlineAnswerLocked.value || !resumed.value || !isCurrentQuestionOpen())) return

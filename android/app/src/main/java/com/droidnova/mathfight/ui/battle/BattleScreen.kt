@@ -118,8 +118,8 @@ fun MathFightApp(
         else if (searchingWithoutRoom) SearchScreen(displayName, profileStats, search, onCancelMatch)
         else HomeScreen(onStart, settings, onSound, onVibration,
             debugConnection, serverUrl, connectionStatus, connectionMessage, onServerUrl, onConnect, onDisconnect,
-            roomCodeInput, room, roomError, onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom, onReady, onProfile, onFindMatch,
-            difficulty, onDifficulty, onLeaderboard)
+             roomCodeInput, room, roomError, onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom, onReady, onProfile, onFindMatch,
+             search.error, difficulty, onDifficulty, onLeaderboard)
         BattlePhase.RESULT -> ResultScreen(state.winner, onRestart, onFindNewOpponent, onlineMatch != null, onlineSubmissionStatus, localName, opponentName, rankedResult, xpResult, isResumed, consumeXpAnimation)
         else -> BattleScreen(
             state = state,
@@ -154,8 +154,9 @@ private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
                        onServerUrl: (String) -> Unit, onConnect: () -> Unit, onDisconnect: () -> Unit,
                        roomCodeInput: String, room: RoomInfo?, roomError: String,
                        onRoomCode: (String) -> Unit, onCreateRoom: () -> Unit,
-                       onJoinRoom: () -> Unit, onLeaveRoom: () -> Unit, onReady: () -> Unit, onProfile: () -> Unit,
-                       onFindMatch: () -> Unit, difficulty: Difficulty, onDifficulty: (Difficulty) -> Unit, onLeaderboard: () -> Unit) {
+                        onJoinRoom: () -> Unit, onLeaveRoom: () -> Unit, onReady: () -> Unit, onProfile: () -> Unit,
+                        onFindMatch: () -> Unit, searchError: String, difficulty: Difficulty,
+                        onDifficulty: (Difficulty) -> Unit, onLeaderboard: () -> Unit) {
     Surface(modifier = Modifier.fillMaxSize()) {
         Column(
             modifier = Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(24.dp),
@@ -177,13 +178,15 @@ private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
-            Button(onClick = onStart, modifier = Modifier.heightIn(min = 48.dp)) {
+            Button(onClick = onStart, enabled = room == null, modifier = Modifier.heightIn(min = 48.dp)) {
                 Text("Start Battle")
             }
             Button(onClick = onFindMatch, enabled = connectionStatus == BattleViewModel.ConnectionStatus.CONNECTED && room == null,
                 modifier = Modifier.padding(top = 8.dp).heightIn(min = 48.dp)) {
                 Text("Find Match")
             }
+            if (searchError.isNotBlank()) Text(searchError, color = MaterialTheme.colorScheme.error,
+                style = MaterialTheme.typography.bodySmall)
             FeedbackControls(settings, onSound, onVibration)
         }
     }
@@ -411,7 +414,7 @@ private fun ConnectionCheckPanel(
                 Text("Players: ${room.playerCount}/2")
                 Text("Difficulty: ${room.difficulty.name.lowercase().replaceFirstChar { it.uppercase() }}")
                 if (room.ranked) Text("Ranked • Host ${room.hostRating} ${room.hostTier} • Guest ${room.guestRating ?: "—"} ${room.guestTier ?: ""}")
-                if (room.role.equals("Host", true) && !room.matchActive) DifficultySelector(room.difficulty, onDifficulty)
+                if (!room.ranked && room.role.equals("Host", true) && !room.matchActive) DifficultySelector(room.difficulty, onDifficulty)
                 Text("Host: ${room.hostName} • ${if (room.hostReady) "Ready" else "Not ready"}")
                 Text("Guest: ${room.guestName.ifBlank { "Waiting…" }} • ${if (room.guestReady) "Ready" else "Not ready"}")
                 Text(if (room.playerCount == 2) "Both players connected" else "Waiting for opponent…")

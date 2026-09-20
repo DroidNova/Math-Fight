@@ -55,4 +55,7 @@ async function bootstrap() {
   process.once('SIGINT', () => void shutdown('SIGINT'));
 }
 
-void bootstrap();
+void bootstrap().catch(() => {
+  Logger.error(JSON.stringify({ event: 'server_start_failed', code: 'SERVICE_UNAVAILABLE' }), 'Bootstrap');
+  process.exitCode = 1;
+});

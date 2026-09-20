@@ -16,6 +16,7 @@ type Match = { matchId: string; difficulty: Difficulty; ranked: boolean; hostNam
 type Player = { id: string; tokenHash: string; profileId?: string; displayName?: string; accountId?: string; rating?: number; searchId?: string; socket?: Socket; roomCode?: string; deadline?: number; graceTimer?: NodeJS.Timeout };
 type Room = { code: string; difficulty: Difficulty; ranked: boolean; host: Player; guest?: Player; hostReady: boolean; guestReady: boolean; match?: Match };
 type SearchEntry = { player: Player; searchId: string; difficulty: Difficulty; joinedAt: number };
+const MATCHMAKING_SEARCH_TTL_MS = 5 * 60_000;
 
 @WebSocketGateway({
   cors: { credentials: false, origin: (origin: string | undefined, callback: (error: Error | null, allowed?: boolean) => void) =>
@@ -35,6 +36,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   private readonly accountPlayers = new Map<string, Player>();
   private readonly profileSyncs = new Set<string>();
   private readonly matchmakingQueue: SearchEntry[] = [];
+  private readonly pendingSettlements = new Set<Promise<unknown>>();
   private matchmakingTimer?: NodeJS.Timeout;
   private shuttingDown = false;
 
@@ -187,7 +189,10 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
       const account = await this.accounts.authenticate(profileId, name, hasAccountToken ? body.accountToken as string : undefined);
       if (player.accountId && player.accountId !== account.player.id) return safeError('FORBIDDEN');
       const active = this.accountPlayers.get(account.player.id);
-      if (active && active !== player) return safeError('ACCOUNT_IN_USE');
+      if (active && active !== player) {
+        if (!active.socket && !active.roomCode && !active.searchId) this.removePlayer(active);
+        else return safeError('ACCOUNT_IN_USE');
+      }
       if (account.player.displayName !== name) {
         const nameLimit = this.rate(client, account.player.id, 'profile_name_change', [{ scope: 'profile-name', limit: 5, windowMs: 60 * 60_000 }]);
         if (nameLimit) return nameLimit;
@@ -367,10 +372,14 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   }
 
   private discardInvalidSearchers() {
+    const now = Date.now();
     for (let i = this.matchmakingQueue.length - 1; i >= 0; i--) {
       const entry = this.matchmakingQueue[i];
-      if (!entry.player.socket || !entry.player.displayName || entry.player.roomCode || entry.player.searchId !== entry.searchId) {
+      const expired = now - entry.joinedAt >= MATCHMAKING_SEARCH_TTL_MS;
+      if (expired || !entry.player.socket || !entry.player.displayName || entry.player.roomCode || entry.player.searchId !== entry.searchId) {
         this.matchmakingQueue.splice(i, 1);
+        if (entry.player.searchId === entry.searchId) entry.player.searchId = undefined;
+        if (expired) this.emitSearchStatus(entry.player, entry.searchId, 'expired', entry.difficulty);
       }
     }
   }
@@ -459,6 +468,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     const room = code ? this.rooms.get(code) : undefined;
     if (!room) return safeError('INVALID_STATE');
     if (room.match && room.match.phase !== 'FINISHED') return safeError('INVALID_STATE');
+    if (room.ranked && room.match?.phase === 'FINISHED') return safeError('INVALID_STATE');
     const ready = body.ready;
     if (room.host === player) room.hostReady = ready;
     else if (room.guest === player) room.guestReady = ready;
@@ -480,7 +490,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     const room = player?.roomCode ? this.rooms.get(player.roomCode) : undefined;
     const difficulty = this.parseDifficulty(body.difficulty);
     if (!difficulty) return safeError('INVALID_PAYLOAD');
-    if (!room || room.host !== player) return safeError('FORBIDDEN');
+    if (!room || room.host !== player || room.ranked) return safeError('FORBIDDEN');
     if (room.match && room.match.phase !== 'FINISHED') return safeError('INVALID_STATE');
     room.difficulty = difficulty;
     room.hostReady = false;
@@ -603,6 +613,13 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
         if (!room.guest.socket) this.removePlayer(room.guest);
       }
     } else if (room.guest === player) {
+      if (room.ranked) {
+        this.rooms.delete(code);
+        room.host.roomCode = undefined;
+        room.host.socket?.emit('room:closed', { code, message: 'Opponent left the room' });
+        if (!room.host.socket) this.removePlayer(room.host);
+        return code;
+      }
       room.guest = undefined;
       room.hostReady = false;
       room.guestReady = false;
@@ -746,8 +763,10 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     host.socket?.emit('match:result', this.snapshot(match, room, 'host'));
     guest?.socket?.emit('match:result', this.snapshot(match, room, 'guest'));
     this.emitState(room.code);
+    const settlement = this.accounts.recordMatch({ matchId: match.matchId, hostId: host.accountId, guestId: guest?.accountId, hostName: match.hostName, guestName: match.guestName, winnerId: attacker === 'host' ? host.accountId : guest?.accountId, difficulty: match.difficulty, finishReason: message && match.hostHp > 0 && match.guestHp > 0 ? 'forfeit' : 'normal', hostHp: match.hostHp, guestHp: match.guestHp, startedAt: match.startedAt, matchType: match.ranked ? 'RANKED' : 'UNRANKED' });
+    this.pendingSettlements.add(settlement);
     try {
-      const recorded = await this.accounts.recordMatch({ matchId: match.matchId, hostId: host.accountId, guestId: guest?.accountId, hostName: match.hostName, guestName: match.guestName, winnerId: attacker === 'host' ? host.accountId : guest?.accountId, difficulty: match.difficulty, finishReason: message && match.hostHp > 0 && match.guestHp > 0 ? 'forfeit' : 'normal', hostHp: match.hostHp, guestHp: match.guestHp, startedAt: match.startedAt, matchType: match.ranked ? 'RANKED' : 'UNRANKED' });
+      const recorded = await settlement;
       if (recorded) {
         const { hostProgression, guestProgression, ...rating } = recorded;
         match.rating = rating;
@@ -756,6 +775,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
         if (match.ranked) { host.rating = recorded.hostRatingAfter ?? host.rating; if (guest) guest.rating = recorded.guestRatingAfter ?? guest.rating; }
       }
     } catch { /* Result remains valid; no progression is fabricated on persistence failure. */ }
+    finally { this.pendingSettlements.delete(settlement); }
     match.revision++;
     host.socket?.emit('match:settled', this.snapshot(match, room, 'host'));
     guest?.socket?.emit('match:settled', this.snapshot(match, room, 'guest'));
@@ -884,7 +904,15 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     return { ok: true };
   }
 
-  beforeApplicationShutdown() { this.prepareShutdown(); }
+  async beforeApplicationShutdown() {
+    this.prepareShutdown();
+    if (this.pendingSettlements.size) {
+      await Promise.race([
+        Promise.allSettled([...this.pendingSettlements]),
+        new Promise<void>(resolve => setTimeout(resolve, 5_000).unref()),
+      ]);
+    }
+  }
 
   onApplicationShutdown() { this.prepareShutdown(); }
 

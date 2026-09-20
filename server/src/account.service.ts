@@ -83,7 +83,7 @@ export class AccountService {
   async stats(playerId: string) {
     const player = await this.players.findOne({ where: { id: playerId } });
     if (!player) return undefined;
-    const matches = await this.matches.find({ where: [{ hostPlayerId: playerId }, { guestPlayerId: playerId }], order: { completedAt: 'DESC' }, take: 10 });
+    const matches = await this.matches.find({ where: [{ hostPlayerId: playerId }, { guestPlayerId: playerId }], order: { completedAt: 'DESC', id: 'DESC' }, take: 10 });
     const position = await this.position(player);
     return { ...progression(player.totalXp), matchesPlayed: player.wins + player.losses, wins: player.wins, losses: player.losses, rating: player.rating, tier: this.tier(player.rating), leaderboardPosition: position, winRate: player.wins + player.losses ? player.wins / (player.wins + player.losses) : 0, matches: matches.map(match => ({ matchId: match.matchId, localName: match.hostPlayerId === playerId ? match.hostName : match.guestName, result: match.winnerId === playerId ? 'WIN' : 'LOSS', opponentName: match.hostPlayerId === playerId ? match.guestName : match.hostName, difficulty: match.difficulty, finishReason: match.finishReason, matchType: match.matchType, ratingChange: match.hostPlayerId === playerId ? match.hostRatingDelta : match.guestRatingDelta, progression: match.hostPlayerId === playerId ? this.completedResult(match, false).hostProgression : this.completedResult(match, false).guestProgression, completedAt: match.completedAt })) };
   }
@@ -91,14 +91,25 @@ export class AccountService {
   async leaderboard(playerId: string) {
     const players = await this.players.find({ order: { rating: 'DESC', wins: 'DESC', losses: 'ASC', createdAt: 'ASC', id: 'ASC' }, take: 100 });
     const current = await this.players.findOne({ where: { id: playerId } });
-    const all = current && !players.some(p => p.id === playerId) ? await this.players.find({ order: { rating: 'DESC', wins: 'DESC', losses: 'ASC', createdAt: 'ASC', id: 'ASC' } }) : players;
-    const position = current ? all.findIndex(p => p.id === playerId) + 1 : 0;
+    const position = current ? await this.position(current) : 0;
     return { players: players.map((p, index) => this.leaderboardRow(p, index + 1, p.id === playerId)), currentPosition: position };
   }
 
   tier(rating: number) { return rating < 900 ? 'Bronze' : rating < 1100 ? 'Silver' : rating < 1300 ? 'Gold' : rating < 1500 ? 'Platinum' : 'Diamond'; }
   private leaderboardRow(player: PlayerEntity, position: number, current: boolean) { return { position, displayName: player.displayName, rating: player.rating, tier: this.tier(player.rating), wins: player.wins, losses: player.losses, current }; }
-  private async position(player: PlayerEntity) { const all = await this.players.find({ order: { rating: 'DESC', wins: 'DESC', losses: 'ASC', createdAt: 'ASC', id: 'ASC' } }); return all.findIndex(item => item.id === player.id) + 1; }
+  private async position(player: PlayerEntity) {
+    const ahead = await this.players.createQueryBuilder('candidate')
+      .where('candidate.rating > :rating', { rating: player.rating })
+      .orWhere('candidate.rating = :rating AND candidate.wins > :wins', { rating: player.rating, wins: player.wins })
+      .orWhere('candidate.rating = :rating AND candidate.wins = :wins AND candidate.losses < :losses',
+        { rating: player.rating, wins: player.wins, losses: player.losses })
+      .orWhere('candidate.rating = :rating AND candidate.wins = :wins AND candidate.losses = :losses AND candidate.createdAt < :createdAt',
+        { rating: player.rating, wins: player.wins, losses: player.losses, createdAt: player.createdAt })
+      .orWhere('candidate.rating = :rating AND candidate.wins = :wins AND candidate.losses = :losses AND candidate.createdAt = :createdAt AND candidate.id < :id',
+        { rating: player.rating, wins: player.wins, losses: player.losses, createdAt: player.createdAt, id: player.id })
+      .getCount();
+    return ahead + 1;
+  }
 
   private hash(value: string) { return createHash('sha256').update(value).digest('hex'); }
   private tokenMatches(rawToken: string, storedHash: string) {

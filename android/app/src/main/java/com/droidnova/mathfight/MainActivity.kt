@@ -162,14 +162,22 @@ class MainActivity : ComponentActivity() {
     override fun onResume() {
         super.onResume()
         battleViewModel.setResumed(true)
-        battleViewModel.setConnectionForeground(true)
     }
 
     override fun onPause() {
         battleViewModel.setResumed(false)
-        battleViewModel.setConnectionForeground(false)
         audio.stop()
         super.onPause()
+    }
+
+    override fun onStart() {
+        super.onStart()
+        battleViewModel.setConnectionForeground(true)
+    }
+
+    override fun onStop() {
+        if (!isChangingConfigurations) battleViewModel.setConnectionForeground(false)
+        super.onStop()
     }
 
     override fun onDestroy() {
