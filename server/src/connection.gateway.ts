@@ -1,9 +1,11 @@
-import { ConnectedSocket, MessageBody, SubscribeMessage, WebSocketGateway, OnGatewayConnection, OnGatewayDisconnect } from '@nestjs/websockets';
-import { OnApplicationShutdown } from '@nestjs/common';
-import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
-import { Socket } from 'socket.io';
-import { AccountService } from './account.service';
+import { ConnectedSocket, MessageBody, SubscribeMessage, WebSocketGateway, OnGatewayConnection, OnGatewayDisconnect, WebSocketServer } from '@nestjs/websockets';
+import { BeforeApplicationShutdown, Logger, OnApplicationShutdown } from '@nestjs/common';
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { Server, Socket } from 'socket.io';
+import { AccountService, InvalidAccountTokenError } from './account.service';
 import { progressionResult } from './progression';
+import { allowOrigin } from './server-config';
+import { isAnswer, isPositiveSafeInteger, isRevision, isSecretToken, isStrictPayload, isUuid, isUuidV4, normalizePlayerName, safeError, SecurityService } from './security';
 
 type Role = 'host' | 'guest';
 type Difficulty = 'EASY' | 'STANDARD' | 'EXPERT';
@@ -11,57 +13,123 @@ type Question = { matchId: string; questionId: number; left: number; operation: 
 type MatchPhase = 'SCHEDULED' | 'ANSWERING' | 'RESOLVING' | 'PAUSED' | 'FINISHED';
 type ScheduleReason = 'FIRST' | 'NEXT' | 'RESUME';
 type Match = { matchId: string; difficulty: Difficulty; ranked: boolean; hostName: string; guestName: string; question: Question; phase: MatchPhase; opensAt?: number; closesAt?: number; scheduleReason?: ScheduleReason; requiresReceipts: boolean; hostHp: number; guestHp: number; revision: number; attacker?: Role; winner?: Role; message?: string; startedAt: Date; timer?: NodeJS.Timeout; expiryTimer?: NodeJS.Timeout; requests: Map<string, object>; received: Set<string>; expiredQuestions: Set<number>; rating?: object; hostProgression?: ReturnType<typeof progressionResult>; guestProgression?: ReturnType<typeof progressionResult> };
-type Player = { id: string; token: string; profileId?: string; displayName?: string; accountId?: string; rating?: number; searchId?: string; socket?: Socket; roomCode?: string; deadline?: number; graceTimer?: NodeJS.Timeout };
+type Player = { id: string; tokenHash: string; profileId?: string; displayName?: string; accountId?: string; rating?: number; searchId?: string; socket?: Socket; roomCode?: string; deadline?: number; graceTimer?: NodeJS.Timeout };
 type Room = { code: string; difficulty: Difficulty; ranked: boolean; host: Player; guest?: Player; hostReady: boolean; guestReady: boolean; match?: Match };
 type SearchEntry = { player: Player; searchId: string; difficulty: Difficulty; joinedAt: number };
 
-@WebSocketGateway({ cors: true, pingInterval: 3_000, pingTimeout: 5_000 })
-export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconnect, OnApplicationShutdown {
-  constructor(private readonly accounts: AccountService) {}
+@WebSocketGateway({
+  cors: { credentials: false, origin: (origin: string | undefined, callback: (error: Error | null, allowed?: boolean) => void) =>
+    callback(null, allowOrigin(origin)) },
+  allowRequest: (request: { headers: { origin?: string } }, callback: (error: string | null, success: boolean) => void) =>
+    callback(null, allowOrigin(request.headers.origin)),
+  maxHttpBufferSize: 16 * 1024,
+  pingInterval: 3_000,
+  pingTimeout: 5_000,
+})
+export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconnect, BeforeApplicationShutdown, OnApplicationShutdown {
+  constructor(private readonly accounts: AccountService, private readonly security: SecurityService) {}
+  @WebSocketServer() private server!: Server;
+  private readonly logger = new Logger(ConnectionGateway.name);
   private readonly rooms = new Map<string, Room>();
   private readonly players = new Map<string, Player>();
+  private readonly accountPlayers = new Map<string, Player>();
+  private readonly profileSyncs = new Set<string>();
   private readonly matchmakingQueue: SearchEntry[] = [];
   private matchmakingTimer?: NodeJS.Timeout;
+  private shuttingDown = false;
 
-  handleConnection(client: Socket) { console.log(`Socket connected: ${client.id}`); }
+  handleConnection(client: Socket) {
+    if (!this.security.isAcceptingWork()) {
+      client.emit('server:shutdown', safeError('SERVER_SHUTDOWN'));
+      client.disconnect(true);
+      return;
+    }
+    const limit = this.security.consume(this.clientIp(client), [{ scope: 'connection', limit: 20, windowMs: 60_000 }]);
+    if (!limit.allowed) {
+      client.emit('server:error', this.security.rateError('connection', client.id, limit));
+      client.disconnect(true);
+      return;
+    }
+    client.data.acceptedConnection = true;
+    this.logger.log(JSON.stringify({ event: 'socket_connected', socketId: client.id }));
+  }
+
   handleDisconnect(client: Socket) {
+    if (this.shuttingDown || !this.security.isAcceptingWork()) return;
     const player = this.playerFor(client);
     if (player) {
       if (this.removeSearch(player)) {
         player.socket = undefined;
+        this.startGrace(player);
       } else this.connectionLost(player);
     }
-    console.log(`Socket disconnected: ${client.id}`);
+    if (client.data.acceptedConnection === true) {
+      this.logger.log(JSON.stringify({ event: 'socket_disconnected', socketId: client.id }));
+    }
   }
 
   // Only the currently bound socket may act for this temporary session.
   private playerFor(client: Socket) {
-    const player = this.players.get(client.data.playerId as string);
+    const id = typeof client.data.playerId === 'string' ? client.data.playerId : '';
+    const player = this.players.get(id);
     return player?.socket === client ? player : undefined;
   }
 
+  private authenticatedPlayer(client: Socket) {
+    const player = this.playerFor(client);
+    return player?.accountId && player.profileId && player.displayName ? player : undefined;
+  }
+
+  private clientIp(client: Socket) {
+    return client.conn.remoteAddress || client.handshake.address || 'unknown';
+  }
+
+  private unavailable() {
+    return this.security.isAcceptingWork() ? undefined : safeError('SERVER_SHUTDOWN');
+  }
+
+  private rate(client: Socket, subject: string, event: string, rules: readonly { scope: string; limit: number; windowMs: number }[]) {
+    const result = this.security.consume(subject, rules);
+    return result.allowed ? undefined : this.security.rateError(event, client.id, result);
+  }
+
+  private authError(client: Socket) {
+    this.security.securityWarning('protected_event', 'AUTH_REQUIRED', client.id);
+    return safeError('AUTH_REQUIRED');
+  }
+
   @SubscribeMessage('session:open')
-  openSession(@ConnectedSocket() client: Socket, @MessageBody() body: { playerId?: string; resumeToken?: string }) {
+  openSession(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
+    const unavailable = this.unavailable();
+    if (unavailable) return unavailable;
+    if (!isStrictPayload(body, [], ['playerId', 'resumeToken'])) return safeError('INVALID_PAYLOAD');
+    const hasPlayerId = Object.prototype.hasOwnProperty.call(body, 'playerId');
+    const hasToken = Object.prototype.hasOwnProperty.call(body, 'resumeToken');
+    if (hasPlayerId !== hasToken || (hasPlayerId && (!isUuid(body.playerId) || !isSecretToken(body.resumeToken)))) return safeError('INVALID_PAYLOAD');
+    const limited = this.rate(client, this.clientIp(client), 'session_open', [{ scope: 'session-open', limit: 10, windowMs: 60_000 }]);
+    if (limited) return limited;
     const bound = this.playerFor(client);
     if (bound) return this.sessionResponse(bound);
     let player: Player;
-    if (body?.playerId || body?.resumeToken) {
-      const existing = this.players.get(String(body.playerId));
-      const token = Buffer.from(String(body.resumeToken ?? ''));
-      if (!existing || token.length !== existing.token.length ||
-          !timingSafeEqual(token, Buffer.from(existing.token))) return { ok: false, error: 'Session expired. Connect again.' };
+    let issuedToken: string | undefined;
+    if (hasPlayerId && hasToken) {
+      const existing = this.players.get(body.playerId as string);
+      const suppliedHash = this.hashSecret(body.resumeToken as string);
+      if (!existing || !timingSafeEqual(Buffer.from(suppliedHash, 'hex'), Buffer.from(existing.tokenHash, 'hex'))) return safeError('SESSION_EXPIRED');
       if (existing.deadline && Date.now() >= existing.deadline) {
         this.expirePlayer(existing);
-        return { ok: false, error: 'Reconnection time expired' };
+        return safeError('SESSION_EXPIRED');
       }
       player = existing;
       if (player.socket && player.socket !== client) {
         const old = player.socket;
-        this.connectionLost(player);
+        if (this.removeSearch(player)) player.socket = undefined;
+        else this.connectionLost(player);
         old.disconnect(true);
       }
     } else {
-      player = { id: randomUUID(), token: randomBytes(32).toString('hex') };
+      issuedToken = randomBytes(32).toString('hex');
+      player = { id: randomUUID(), tokenHash: this.hashSecret(issuedToken) };
       this.players.set(player.id, player);
     }
     clearTimeout(player.graceTimer);
@@ -73,69 +141,110 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     if (room?.match?.phase === 'PAUSED') this.resumeMatch(room);
     // Completed matches can be restored without replaying their presentation.
     if (room?.match?.phase === 'FINISHED' || room?.match?.phase === 'PAUSED') room.match.revision++;
-    return this.sessionResponse(player);
+    return this.sessionResponse(player, issuedToken);
   }
 
-  private sessionResponse(player: Player) {
+  private sessionResponse(player: Player, issuedToken?: string) {
     const room = player.roomCode ? this.rooms.get(player.roomCode) : undefined;
-    return { ok: true, playerId: player.id, resumeToken: player.token,
+    return { ok: true, playerId: player.id, ...(issuedToken ? { resumeToken: issuedToken } : {}),
       room: room ? this.roomState(room, player) : undefined,
       snapshot: room?.match ? this.snapshot(room.match, room, room.host === player ? 'host' : 'guest') : undefined };
   }
 
   @SubscribeMessage('session:leave')
-  leaveSession(@ConnectedSocket() client: Socket) {
+  leaveSession(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
+    if (!isStrictPayload(body)) return safeError('INVALID_PAYLOAD');
+    const unavailable = this.unavailable();
+    if (unavailable) return unavailable;
     const player = this.playerFor(client);
-    if (player) { this.removeSearch(player); this.leaveRoom(player); this.removePlayer(player); }
+    if (!player) return this.authError(client);
+    this.removeSearch(player);
+    this.leaveRoom(player);
+    this.removePlayer(player);
     return { ok: true };
   }
 
   @SubscribeMessage('profile:sync')
-  async syncProfile(@ConnectedSocket() client: Socket, @MessageBody() body: { profileId?: unknown; displayName?: unknown; accountToken?: unknown }) {
+  async syncProfile(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
+    const unavailable = this.unavailable();
+    if (unavailable) return unavailable;
+    if (!isStrictPayload(body, ['profileId', 'displayName'], ['accountToken']) || !isUuid(body.profileId)) return safeError('INVALID_PAYLOAD');
+    const name = normalizePlayerName(body.displayName);
+    const hasAccountToken = Object.prototype.hasOwnProperty.call(body, 'accountToken');
+    if (!name || (hasAccountToken && !isSecretToken(body.accountToken))) return safeError('INVALID_PAYLOAD');
     const player = this.playerFor(client);
-    if (!player) return { ok: false, error: 'Connect again to start a session' };
-    if (typeof body?.profileId !== 'string' || body.profileId.length !== 36 || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(body.profileId)) {
-      return { ok: false, error: 'Invalid profile ID: expected a UUID' };
-    }
-    // Only literal spaces are normalized: tabs, newlines, controls and symbols stay invalid.
-    const name = typeof body?.displayName === 'string' ? body.displayName.replace(/^ +| +$/g, '').replace(/ +/g, ' ') : '';
-    if (Array.from(name).length < 3 || Array.from(name).length > 16 || /[^\p{L}\p{N}_ ]/u.test(name)) {
-      return { ok: false, error: 'Use 3–16 letters or numbers, spaces, or underscore.' };
-    }
-    const profileId = body.profileId.toLowerCase();
+    if (!player) return this.authError(client);
+    if (this.profileSyncs.has(player.id)) return safeError('INVALID_STATE');
+    const authLimit = hasAccountToken
+      ? this.rate(client, this.clientIp(client), 'account_authentication', [{ scope: 'account-auth', limit: 10, windowMs: 60_000 }])
+      : this.rate(client, this.clientIp(client), 'account_registration', [{ scope: 'account-registration', limit: 5, windowMs: 60 * 60_000 }]);
+    if (authLimit) return authLimit;
+    const profileId = (body.profileId as string).toLowerCase();
     const room = player.roomCode ? this.rooms.get(player.roomCode) : undefined;
-    if (room?.match && room.match.phase !== 'FINISHED' && (player.profileId !== profileId || player.displayName !== name)) {
-      return { ok: false, error: 'Finish the active match before changing your profile' };
-    }
-    let account;
+    if (room?.match && room.match.phase !== 'FINISHED' && (player.profileId !== profileId || player.displayName !== name)) return safeError('INVALID_STATE');
+    this.profileSyncs.add(player.id);
     try {
-      account = await this.accounts.authenticate(profileId, name, typeof body.accountToken === 'string' ? body.accountToken : undefined);
+      const account = await this.accounts.authenticate(profileId, name, hasAccountToken ? body.accountToken as string : undefined);
+      if (player.accountId && player.accountId !== account.player.id) return safeError('FORBIDDEN');
+      const active = this.accountPlayers.get(account.player.id);
+      if (active && active !== player) return safeError('ACCOUNT_IN_USE');
+      if (account.player.displayName !== name) {
+        const nameLimit = this.rate(client, account.player.id, 'profile_name_change', [{ scope: 'profile-name', limit: 5, windowMs: 60 * 60_000 }]);
+        if (nameLimit) return nameLimit;
+      }
+      const previouslyClaimed = this.accountPlayers.get(account.player.id) === player;
+      this.accountPlayers.set(account.player.id, player);
+      try {
+        if (account.player.displayName !== name) await this.accounts.updateDisplayName(account.player.id, name);
+      } catch {
+        if (!previouslyClaimed) this.accountPlayers.delete(account.player.id);
+        return safeError('SERVICE_UNAVAILABLE');
+      }
+      player.profileId = profileId;
+      player.displayName = name;
+      player.accountId = account.player.id;
+      player.rating = account.player.rating;
+      if (room) this.emitState(room.code);
+      return { ok: true, displayName: name, ...(account.issuedToken ? { accountToken: account.issuedToken } : {}), room: room ? this.roomState(room, player) : undefined };
     } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : 'Account authentication failed' };
+      return error instanceof InvalidAccountTokenError ? safeError('AUTH_REQUIRED') : safeError('SERVICE_UNAVAILABLE');
+    } finally {
+      this.profileSyncs.delete(player.id);
     }
-    player.profileId = profileId;
-    player.displayName = name;
-    player.accountId = account.player.id;
-    player.rating = account.player.rating;
-    if (room) this.emitState(room.code);
-    return { ok: true, displayName: name, accountToken: account.issuedToken, room: room ? this.roomState(room, player) : undefined };
   }
 
   @SubscribeMessage('profile:stats')
-  async profileStats(@ConnectedSocket() client: Socket) {
-    const player = this.playerFor(client);
-    if (!player?.accountId) return { ok: false, error: 'Profile is not registered' };
-    const stats = await this.accounts.stats(player.accountId);
-    return stats ? { ok: true, ...stats } : { ok: false, error: 'Statistics unavailable' };
+  async profileStats(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
+    if (!isStrictPayload(body)) return safeError('INVALID_PAYLOAD');
+    const unavailable = this.unavailable();
+    if (unavailable) return unavailable;
+    const player = this.authenticatedPlayer(client);
+    if (!player) return this.authError(client);
+    const limited = this.rate(client, player.accountId!, 'profile_stats', [{ scope: 'account-read', limit: 30, windowMs: 60_000 }]);
+    if (limited) return limited;
+    try {
+      const stats = await this.accounts.stats(player.accountId!);
+      return stats ? { ok: true, ...stats } : safeError('SERVICE_UNAVAILABLE');
+    } catch {
+      return safeError('SERVICE_UNAVAILABLE');
+    }
   }
 
   @SubscribeMessage('leaderboard:get')
-  async getLeaderboard(@ConnectedSocket() client: Socket) {
-    const player = this.playerFor(client);
-    if (!player?.accountId) return { ok: false, error: 'Profile is not registered' };
-    return { ok: true, ...(await this.accounts.leaderboard(player.accountId)) };
+  async getLeaderboard(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
+    if (!isStrictPayload(body)) return safeError('INVALID_PAYLOAD');
+    const unavailable = this.unavailable();
+    if (unavailable) return unavailable;
+    const player = this.authenticatedPlayer(client);
+    if (!player) return this.authError(client);
+    const limited = this.rate(client, player.accountId!, 'leaderboard_get', [{ scope: 'account-read', limit: 30, windowMs: 60_000 }]);
+    if (limited) return limited;
+    try {
+      return { ok: true, ...(await this.accounts.leaderboard(player.accountId!)) };
+    } catch {
+      return safeError('SERVICE_UNAVAILABLE');
+    }
   }
-
   private parseDifficulty(value: unknown): Difficulty | undefined {
     return value === 'EASY' || value === 'STANDARD' || value === 'EXPERT' ? value : undefined;
   }
@@ -143,23 +252,38 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   private tier(rating: number) { return rating < 900 ? 'Bronze' : rating < 1100 ? 'Silver' : rating < 1300 ? 'Gold' : rating < 1500 ? 'Platinum' : 'Diamond'; }
 
   @SubscribeMessage('connection:check')
-  connectionCheck(@ConnectedSocket() _client: Socket) {
+  connectionCheck(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
+    if (!isStrictPayload(body)) return safeError('INVALID_PAYLOAD');
+    const unavailable = this.unavailable();
+    if (unavailable) return unavailable;
+    const limited = this.rate(client, client.id, 'connection_check', [{ scope: 'socket-check', limit: 20, windowMs: 60_000 }]);
+    if (limited) return limited;
     return { ok: true, message: 'Math Fight server ready' };
   }
 
   @SubscribeMessage('time:sync')
-  timeSync(@ConnectedSocket() client: Socket) {
-    if (!this.playerFor(client)) return { ok: false, error: 'Connect again to start a session' };
+  timeSync(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
+    if (!isStrictPayload(body)) return safeError('INVALID_PAYLOAD');
+    const unavailable = this.unavailable();
+    if (unavailable) return unavailable;
+    if (!this.playerFor(client)) return this.authError(client);
+    const limited = this.rate(client, client.id, 'time_sync', [{ scope: 'socket-time', limit: 12, windowMs: 60_000 }]);
+    if (limited) return limited;
     return { ok: true, serverTime: Date.now() };
   }
 
   @SubscribeMessage('matchmaking:join')
-  matchmakingJoin(@ConnectedSocket() client: Socket, @MessageBody() body: { difficulty?: unknown }) {
-    const player = this.playerFor(client);
-    if (!player || !player.displayName) return { ok: false, error: 'Set up your player profile first' };
-    const difficulty = this.parseDifficulty(body?.difficulty);
-    if (!difficulty) return { ok: false, error: 'Invalid difficulty' };
-    if (player.roomCode) return { ok: false, error: 'You are already in a room or match' };
+  matchmakingJoin(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
+    if (!isStrictPayload(body, ['difficulty'])) return safeError('INVALID_PAYLOAD');
+    const unavailable = this.unavailable();
+    if (unavailable) return unavailable;
+    const player = this.authenticatedPlayer(client);
+    if (!player) return this.authError(client);
+    const difficulty = this.parseDifficulty(body.difficulty);
+    if (!difficulty) return safeError('INVALID_PAYLOAD');
+    const limited = this.rate(client, player.accountId!, 'matchmaking_join', [{ scope: 'matchmaking', limit: 12, windowMs: 60_000 }]);
+    if (limited) return limited;
+    if (player.roomCode) return safeError('ALREADY_IN_ROOM');
     const existing = this.matchmakingQueue.find(entry => entry.player === player);
     if (existing) return { ok: true, status: 'waiting', searchId: existing.searchId, difficulty: existing.difficulty };
     const searchId = randomUUID();
@@ -172,21 +296,32 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   }
 
   @SubscribeMessage('matchmaking:cancel')
-  matchmakingCancel(@ConnectedSocket() client: Socket, @MessageBody() body: { searchId?: string }) {
-    const player = this.playerFor(client);
-    if (!player) return { ok: false, error: 'Connect again to start a session' };
-    const entry = this.matchmakingQueue.find(item => item.player === player && item.searchId === String(body?.searchId ?? ''));
-    if (!entry) return { ok: true, status: player.roomCode ? 'matched' : 'idle', searchId: body?.searchId };
+  matchmakingCancel(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
+    if (!isStrictPayload(body, ['searchId']) || !isUuidV4(body.searchId)) return safeError('INVALID_PAYLOAD');
+    const unavailable = this.unavailable();
+    if (unavailable) return unavailable;
+    const player = this.authenticatedPlayer(client);
+    if (!player) return this.authError(client);
+    const limited = this.rate(client, player.accountId!, 'matchmaking_cancel', [{ scope: 'matchmaking', limit: 12, windowMs: 60_000 }]);
+    if (limited) return limited;
+    const entry = this.matchmakingQueue.find(item => item.player === player && item.searchId === body.searchId);
+    if (!entry) return { ok: true, status: player.roomCode ? 'matched' : 'idle', searchId: body.searchId };
     this.removeSearch(player, entry.searchId);
     this.emitSearchStatus(player, entry.searchId, 'cancelled');
     return { ok: true, status: 'cancelled', searchId: entry.searchId };
   }
 
   @SubscribeMessage('matchmaking:status')
-  matchmakingStatus(@ConnectedSocket() client: Socket) {
-    const player = this.playerFor(client);
-    const entry = player ? this.matchmakingQueue.find(item => item.player === player) : undefined;
-    return { ok: Boolean(player), status: entry ? 'waiting' : player?.roomCode ? 'matched' : 'idle', searchId: entry?.searchId };
+  matchmakingStatus(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
+    if (!isStrictPayload(body)) return safeError('INVALID_PAYLOAD');
+    const unavailable = this.unavailable();
+    if (unavailable) return unavailable;
+    const player = this.authenticatedPlayer(client);
+    if (!player) return this.authError(client);
+    const limited = this.rate(client, player.accountId!, 'matchmaking_status', [{ scope: 'matchmaking-status', limit: 30, windowMs: 60_000 }]);
+    if (limited) return limited;
+    const entry = this.matchmakingQueue.find(item => item.player === player);
+    return { ok: true, status: entry ? 'waiting' : player.roomCode ? 'matched' : 'idle', searchId: entry?.searchId };
   }
 
   private emitSearchStatus(player: Player, searchId: string, status: string, difficulty?: Difficulty) {
@@ -203,6 +338,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   }
 
   private pairSearchers(difficulty: Difficulty) {
+    if (!this.security.isAcceptingWork()) return;
     this.discardInvalidSearchers();
     const matching = this.matchmakingQueue.filter(entry => entry.difficulty === difficulty);
     while (matching.length >= 2) {
@@ -222,7 +358,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   }
 
   private startMatchmakingTimer() {
-    if (this.matchmakingTimer) return;
+    if (this.matchmakingTimer || !this.security.isAcceptingWork()) return;
     this.matchmakingTimer = setInterval(() => {
       this.discardInvalidSearchers();
       for (const difficulty of ['EASY', 'STANDARD', 'EXPERT'] as Difficulty[]) this.pairSearchers(difficulty);
@@ -259,13 +395,17 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   }
 
   @SubscribeMessage('room:create')
-  createRoom(@ConnectedSocket() client: Socket, @MessageBody() body: { difficulty?: unknown }) {
-    const player = this.playerFor(client);
-    if (!player) return { ok: false, error: 'Connect again to start a session' };
-    if (!player.displayName) return { ok: false, error: 'Set up your player profile first' };
-    if (player.roomCode) return { ok: false, error: 'already in a room' };
-    const difficulty = this.parseDifficulty(body?.difficulty);
-    if (!difficulty) return { ok: false, error: 'Invalid difficulty' };
+  createRoom(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
+    if (!isStrictPayload(body, ['difficulty'])) return safeError('INVALID_PAYLOAD');
+    const unavailable = this.unavailable();
+    if (unavailable) return unavailable;
+    const player = this.authenticatedPlayer(client);
+    if (!player) return this.authError(client);
+    const difficulty = this.parseDifficulty(body.difficulty);
+    if (!difficulty) return safeError('INVALID_PAYLOAD');
+    const limited = this.rate(client, player.accountId!, 'room_create', [{ scope: 'room-entry', limit: 10, windowMs: 60_000 }]);
+    if (limited) return limited;
+    if (player.roomCode || player.searchId) return safeError('ALREADY_IN_ROOM');
     let code = '';
     do { code = this.generateCode(); } while (this.rooms.has(code));
     this.rooms.set(code, { code, difficulty, ranked: false, host: player, hostReady: false, guestReady: false });
@@ -275,16 +415,19 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   }
 
   @SubscribeMessage('room:join')
-  joinRoom(@ConnectedSocket() client: Socket, @MessageBody() body: { code?: string }) {
-    const player = this.playerFor(client);
-    if (!player) return { ok: false, error: 'Connect again to start a session' };
-    if (!player.displayName) return { ok: false, error: 'Set up your player profile first' };
-    if (player.roomCode) return { ok: false, error: 'already in a room' };
-    const code = String(body?.code ?? '').trim().toUpperCase();
-    if (!/^[A-Z0-9]{6}$/.test(code)) return { ok: false, error: 'invalid room code' };
+  joinRoom(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
+    if (!isStrictPayload(body, ['code']) || typeof body.code !== 'string' || !/^[A-Z0-9]{6}$/.test(body.code)) return safeError('INVALID_ROOM_CODE');
+    const unavailable = this.unavailable();
+    if (unavailable) return unavailable;
+    const player = this.authenticatedPlayer(client);
+    if (!player) return this.authError(client);
+    const limited = this.rate(client, player.accountId!, 'room_join', [{ scope: 'room-entry', limit: 10, windowMs: 60_000 }]);
+    if (limited) return limited;
+    if (player.roomCode || player.searchId) return safeError('ALREADY_IN_ROOM');
+    const code = body.code;
     const room = this.rooms.get(code);
-    if (!room) return { ok: false, error: 'room not found' };
-    if (room.guest) return { ok: false, error: 'room full' };
+    if (!room) return safeError('ROOM_NOT_FOUND');
+    if (room.guest) return safeError('ROOM_FULL');
     room.guest = player;
     player.roomCode = code;
     this.emitState(code);
@@ -292,38 +435,53 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   }
 
   @SubscribeMessage('room:leave')
-  leaveRoomMessage(@ConnectedSocket() client: Socket) {
-    const player = this.playerFor(client);
-    if (!player) return { ok: false, error: 'Connect again to start a session' };
+  leaveRoomMessage(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
+    if (!isStrictPayload(body)) return safeError('INVALID_PAYLOAD');
+    const unavailable = this.unavailable();
+    if (unavailable) return unavailable;
+    const player = this.authenticatedPlayer(client);
+    if (!player) return this.authError(client);
     this.removeSearch(player);
     this.leaveRoom(player);
     return { ok: true };
   }
 
   @SubscribeMessage('room:ready')
-  setReady(@ConnectedSocket() client: Socket, @MessageBody() body: { ready?: boolean }) {
-    const player = this.playerFor(client);
+  setReady(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
+    if (!isStrictPayload(body, ['ready']) || typeof body.ready !== 'boolean') return safeError('INVALID_PAYLOAD');
+    const unavailable = this.unavailable();
+    if (unavailable) return unavailable;
+    const player = this.authenticatedPlayer(client);
+    if (!player) return this.authError(client);
+    const limited = this.rate(client, player.accountId!, 'room_ready', [{ scope: 'room-control', limit: 20, windowMs: 60_000 }]);
+    if (limited) return limited;
     const code = player?.roomCode;
     const room = code ? this.rooms.get(code) : undefined;
-    if (!room || !player) return { ok: false, error: 'not in a room' };
-    if (room.match && room.match.phase !== 'FINISHED') return { ok: false, error: 'match already active' };
-    const ready = Boolean(body?.ready);
+    if (!room) return safeError('INVALID_STATE');
+    if (room.match && room.match.phase !== 'FINISHED') return safeError('INVALID_STATE');
+    const ready = body.ready;
     if (room.host === player) room.hostReady = ready;
     else if (room.guest === player) room.guestReady = ready;
-    else return { ok: false, error: 'not in a room' };
+    else return safeError('FORBIDDEN');
     this.emitState(room.code);
     if (room.host.socket && room.guest?.socket && room.hostReady && room.guestReady && (!room.match || room.match.phase === 'FINISHED')) this.startMatch(room);
     return { ok: true, ready };
   }
 
   @SubscribeMessage('room:difficulty')
-  setDifficulty(@ConnectedSocket() client: Socket, @MessageBody() body: { difficulty?: unknown }) {
-    const player = this.playerFor(client);
+  setDifficulty(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
+    if (!isStrictPayload(body, ['difficulty'])) return safeError('INVALID_PAYLOAD');
+    const unavailable = this.unavailable();
+    if (unavailable) return unavailable;
+    const player = this.authenticatedPlayer(client);
+    if (!player) return this.authError(client);
+    const limited = this.rate(client, player.accountId!, 'room_difficulty', [{ scope: 'room-control', limit: 20, windowMs: 60_000 }]);
+    if (limited) return limited;
     const room = player?.roomCode ? this.rooms.get(player.roomCode) : undefined;
-    const difficulty = this.parseDifficulty(body?.difficulty);
-    if (!room || !player || room.host !== player) return { ok: false, error: 'Only the host can change difficulty' };
-    if (!difficulty) return { ok: false, error: 'Invalid difficulty' };
-    if (room.match && room.match.phase !== 'FINISHED') return { ok: false, error: 'Difficulty is locked during a match' };
+    const difficulty = this.parseDifficulty(body.difficulty);
+    if (!difficulty) return safeError('INVALID_PAYLOAD');
+    if (!room || room.host !== player) return safeError('FORBIDDEN');
+    if (room.match && room.match.phase !== 'FINISHED') return safeError('INVALID_STATE');
     room.difficulty = difficulty;
     room.hostReady = false;
     room.guestReady = false;
@@ -332,60 +490,60 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   }
 
   @SubscribeMessage('match:answer')
-  answer(@ConnectedSocket() client: Socket, @MessageBody() body: { requestId?: string; matchId?: string; questionId?: number; answer?: unknown }) {
-    const requestId = String(body?.requestId ?? '');
-    const base = { requestId, matchId: body?.matchId, questionId: body?.questionId };
-    const player = this.playerFor(client);
-    const code = player?.roomCode;
-    const room = code ? this.rooms.get(code) : undefined;
+  answer(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
+    if (!isStrictPayload(body, ['requestId', 'matchId', 'questionId', 'answer']) ||
+        !isUuidV4(body.requestId) || !isUuidV4(body.matchId) || !isPositiveSafeInteger(body.questionId) || !isAnswer(body.answer)) {
+      return safeError('INVALID_PAYLOAD', 1_000, { result: 'invalid' });
+    }
+    const unavailable = this.unavailable();
+    if (unavailable) return { ...unavailable, result: 'invalid', requestId: body.requestId, matchId: body.matchId, questionId: body.questionId };
+    const player = this.authenticatedPlayer(client);
+    if (!player) return { ...this.authError(client), result: 'invalid', requestId: body.requestId, matchId: body.matchId, questionId: body.questionId };
+    const base = { requestId: body.requestId, matchId: body.matchId, questionId: body.questionId };
+    const room = player.roomCode ? this.rooms.get(player.roomCode) : undefined;
     const match = room?.match;
-    if (!room || !match || !player) return { ok: false, result: 'invalid', error: 'no active match', ...base };
-    if (body?.matchId !== match.matchId) {
-      return { ok: false, result: 'invalid', error: 'stale question', ...base };
-    }
-    if (body?.questionId !== match.question.questionId) {
-      if (typeof body?.questionId === 'number' && match.expiredQuestions.has(body.questionId)) {
-        return { ok: false, result: 'question_expired', code: 'QUESTION_EXPIRED', error: 'Question expired', ...base };
-      }
-      return { ok: false, result: 'invalid', error: 'stale question', ...base };
-    }
-    const requestKey = `${player.id}:${requestId}`;
-    const previous = requestId ? match.requests.get(requestKey) : undefined;
+    if (!room || !match) return safeError('MATCH_UNAVAILABLE', 1_000, { result: 'invalid', ...base });
     const role = room.host === player ? 'host' : room.guest === player ? 'guest' : undefined;
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId) || !role) {
-      return { ok: false, result: 'invalid', error: 'invalid request', ...base };
+    if (!role) return safeError('FORBIDDEN', 1_000, { result: 'invalid', ...base });
+    if (body.matchId !== match.matchId) return safeError('STALE_REQUEST', 1_000, { result: 'invalid', ...base });
+    if (body.questionId !== match.question.questionId) {
+      return match.expiredQuestions.has(body.questionId as number)
+        ? safeError('QUESTION_EXPIRED', 1_000, { result: 'question_expired', ...base })
+        : safeError('STALE_REQUEST', 1_000, { result: 'invalid', ...base });
     }
-    if (previous && (previous as { result?: string }).result === 'correct') return previous;
+    const requestKey = player.id + ':' + body.requestId;
+    const previous = match.requests.get(requestKey);
+    if (previous) return previous;
+    const limited = this.rate(client, player.accountId!, 'match_answer', [
+      { scope: 'answer-burst', limit: 6, windowMs: 2_000 },
+      { scope: 'answer-minute', limit: 60, windowMs: 60_000 },
+    ]);
+    if (limited) return { ...limited, result: 'rate_limited', ...base };
     if (match.phase === 'PAUSED' || match.phase === 'FINISHED') {
-      const response = { ok: false, result: 'invalid', error: match.phase === 'PAUSED' ? 'match paused' : 'match finished', ...base };
+      const response = safeError('INVALID_STATE', 1_000, { result: 'invalid', ...base });
       this.rememberRequest(match, requestKey, response);
       return response;
     }
     if (match.phase === 'SCHEDULED' || match.opensAt === undefined || Date.now() < match.opensAt) {
-      const response = { ok: false, result: 'not_open', code: 'NOT_OPEN', error: 'Question is not open yet', opensAt: match.opensAt, ...base };
+      const response = safeError('NOT_OPEN', 1_000, { result: 'not_open', opensAt: match.opensAt, ...base });
       this.rememberRequest(match, requestKey, response);
       return response;
     }
     if (match.phase === 'ANSWERING' && match.closesAt !== undefined && Date.now() >= match.closesAt) {
       this.expireQuestion(room, match, match.question.questionId, match.revision);
-      return { ok: false, result: 'question_expired', code: 'QUESTION_EXPIRED', error: 'Question expired', ...base };
+      return safeError('QUESTION_EXPIRED', 1_000, { result: 'question_expired', ...base });
     }
     if (match.phase === 'ANSWERING' && match.closesAt === undefined) {
-      return { ok: false, result: 'invalid', error: 'question timing unavailable', ...base };
+      return safeError('INVALID_STATE', 1_000, { result: 'invalid', ...base });
     }
-    if (previous) return previous;
     if (match.phase !== 'ANSWERING') {
       const result = match.phase === 'RESOLVING' ? 'already_resolved' : 'invalid';
-      const response = { ok: false, result, error: 'stale question', ...base };
+      const response = safeError(match.phase === 'RESOLVING' ? 'ALREADY_RESOLVED' : 'INVALID_STATE', 1_000, { result, ...base });
       this.rememberRequest(match, requestKey, response);
       return response;
     }
-    const rawAnswer = body.answer;
-    const validInteger = typeof rawAnswer === 'number' ? Number.isInteger(rawAnswer) : typeof rawAnswer === 'string' && /^[+-]?\d+$/.test(rawAnswer.trim());
-    const answer = typeof rawAnswer === 'number' ? rawAnswer : Number(rawAnswer);
-    if (!validInteger || !Number.isInteger(answer)) return { ok: false, result: 'invalid', error: 'answer must be an integer', ...base };
-    if (answer !== this.correctAnswer(match.question)) {
-      const response = { ok: false, result: 'incorrect', wrong: true, error: 'wrong answer', ...base };
+    if (body.answer !== this.correctAnswer(match.question)) {
+      const response = safeError('INCORRECT_ANSWER', 0, { result: 'incorrect', wrong: true, ...base });
       this.rememberRequest(match, requestKey, response);
       return response;
     }
@@ -406,19 +564,22 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
       const current = this.rooms.get(room.code);
       if (current !== room || current.match !== match || match.phase !== 'RESOLVING' || match.question.questionId !== questionId) return;
       if (ko) this.finishMatch(room, role);
-      else {
-        this.scheduleQuestion(room, 1_500, 'NEXT', 'match:question');
-      }
+      else this.scheduleQuestion(room, 1_500, 'NEXT', 'match:question');
     }, 500);
     return accepted;
   }
-
   @SubscribeMessage('match:state')
-  matchState(@ConnectedSocket() client: Socket) {
-    const player = this.playerFor(client);
+  matchState(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
+    if (!isStrictPayload(body)) return safeError('INVALID_PAYLOAD');
+    const unavailable = this.unavailable();
+    if (unavailable) return unavailable;
+    const player = this.authenticatedPlayer(client);
+    if (!player) return this.authError(client);
+    const limited = this.rate(client, player.accountId!, 'match_state', [{ scope: 'match-state', limit: 30, windowMs: 60_000 }]);
+    if (limited) return limited;
     const code = player?.roomCode;
     const room = code ? this.rooms.get(code) : undefined;
-    if (!room?.match) return { ok: false, result: 'ended', error: 'match unavailable' };
+    if (!room?.match || (room.host !== player && room.guest !== player)) return safeError('MATCH_UNAVAILABLE', 1_000, { result: 'ended' });
     return { ok: true, snapshot: this.snapshot(room.match, room, room.host === player ? 'host' : 'guest') };
   }
 
@@ -621,7 +782,7 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   private rememberRequest(match: Match, requestId: string, response: object) {
     if (!requestId) return;
     match.requests.set(requestId, response);
-    while (match.requests.size > 32) match.requests.delete(match.requests.keys().next().value as string);
+    while (match.requests.size > 128) match.requests.delete(match.requests.keys().next().value as string);
   }
 
   private connectionLost(player: Player) {
@@ -686,6 +847,8 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
 
   private removePlayer(player: Player) {
     clearTimeout(player.graceTimer);
+    if (player.accountId && this.accountPlayers.get(player.accountId) === player) this.accountPlayers.delete(player.accountId);
+    this.profileSyncs.delete(player.id);
     player.deadline = undefined;
     player.roomCode = undefined;
     player.socket = undefined;
@@ -700,13 +863,20 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
 
   // A fresh question is kept locked until both phones have received it.
   @SubscribeMessage('match:received')
-  receivedQuestion(@ConnectedSocket() client: Socket, @MessageBody() body: { matchId?: string; questionId?: number; revision?: number }) {
-    const player = this.playerFor(client);
+  receivedQuestion(@ConnectedSocket() client: Socket, @MessageBody() body: unknown) {
+    if (!isStrictPayload(body, ['matchId', 'questionId', 'revision']) || !isUuidV4(body.matchId) ||
+        !isPositiveSafeInteger(body.questionId) || !isRevision(body.revision)) return safeError('INVALID_PAYLOAD');
+    const unavailable = this.unavailable();
+    if (unavailable) return unavailable;
+    const player = this.authenticatedPlayer(client);
+    if (!player) return this.authError(client);
+    const limited = this.rate(client, player.accountId!, 'match_received', [{ scope: 'match-control', limit: 20, windowMs: 60_000 }]);
+    if (limited) return limited;
     const room = player?.roomCode ? this.rooms.get(player.roomCode) : undefined;
     const match = room?.match;
-    if (!player || !room || !match || match.phase !== 'SCHEDULED' || match.scheduleReason !== 'RESUME' ||
-        body?.matchId !== match.matchId ||
-        body?.questionId !== match.question.questionId || body?.revision !== match.revision) return { ok: false };
+    if (!room || !match || (room.host !== player && room.guest !== player)) return safeError('MATCH_UNAVAILABLE');
+    if (match.phase !== 'SCHEDULED' || match.scheduleReason !== 'RESUME' || body.matchId !== match.matchId ||
+        body.questionId !== match.question.questionId || body.revision !== match.revision) return safeError('STALE_REQUEST');
     match.received.add(player.id);
     if (room.host.socket && room.guest?.socket && match.received.has(room.host.id) && match.received.has(room.guest.id)) {
       this.openScheduledQuestion(room, match.revision);
@@ -714,15 +884,31 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
     return { ok: true };
   }
 
-  onApplicationShutdown() {
+  beforeApplicationShutdown() { this.prepareShutdown(); }
+
+  onApplicationShutdown() { this.prepareShutdown(); }
+
+  private prepareShutdown() {
+    if (this.shuttingDown) return;
+    this.shuttingDown = true;
+    this.security.beginShutdown();
     if (this.matchmakingTimer) clearInterval(this.matchmakingTimer);
+    this.matchmakingTimer = undefined;
+    this.matchmakingQueue.length = 0;
     for (const room of this.rooms.values()) {
       clearTimeout(room.match?.timer);
       clearTimeout(room.match?.expiryTimer);
     }
     for (const player of this.players.values()) clearTimeout(player.graceTimer);
+    if (this.server) {
+      this.server.emit('server:shutdown', safeError('SERVER_SHUTDOWN'));
+    }
     this.rooms.clear();
     this.players.clear();
+    this.accountPlayers.clear();
+    this.profileSyncs.clear();
+    if (this.server) this.server.disconnectSockets(true);
+    this.logger.log(JSON.stringify({ event: 'gateway_shutdown', code: 'SERVER_SHUTDOWN' }));
   }
 
   private makeQuestion(matchId: string, questionId: number, difficulty: Difficulty, previous?: Question): Question {
@@ -754,4 +940,6 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
   private generateCode() {
     return Array.from({ length: 6 }, () => 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'[Math.floor(Math.random() * 36)]).join('');
   }
+
+  private hashSecret(value: string) { return createHash('sha256').update(value).digest('hex'); }
 }

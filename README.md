@@ -80,6 +80,10 @@ npm run start:dev
 
 Verify 100/40 and 70/0 rewards, zero XP in private/offline play, Level 2 at 200 XP, persistence across restarts, matching Profile/history/results, and no duplicate award or animation after reconnect/recreation. XP columns are non-negative PostgreSQL integers; all writes roll back on overflow or database failure, and unavailable XP is never invented by Android.
 
+## Milestone 17 local security
+
+The server validates every Socket.IO payload, limits tiny game messages to 16 KB, rate-limits abusive actions in memory, requires an authenticated account for gameplay and profile data, and restricts browser origins through `ALLOWED_ORIGINS`. Android clients without a browser `Origin` header remain supported. Set `TRUST_PROXY_HOPS` only for a known deployment proxy; forwarded addresses are not trusted by default. `/health/live`, `/health/ready`, and the existing `/health` endpoint provide health status. Redis-backed distributed rate limiting is deferred until the server is deployed as multiple instances.
+
 ## Milestone 11 difficulty modes
 
 Easy, Standard, and Expert are shared by offline questions, private rooms, and random matchmaking. Standard is the default and the last selection is saved with the profile preferences. Expert adds exact whole-number division; the server remains authoritative for online answers. Private-room hosts choose the mode and guests inherit it; matchmaking queues are separated by mode. Install the updated APK on both phones and restart the server when changing this protocol.

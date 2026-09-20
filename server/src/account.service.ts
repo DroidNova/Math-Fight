@@ -1,9 +1,11 @@
 import { Injectable } from '@nestjs/common';
 import { InjectDataSource, InjectRepository } from '@nestjs/typeorm';
 import { DataSource, Repository } from 'typeorm';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { CompletedMatchEntity, PlayerEntity } from './entities';
 import { progression, progressionResult } from './progression';
+
+export class InvalidAccountTokenError extends Error {}
 
 @Injectable()
 export class AccountService {
@@ -15,16 +17,18 @@ export class AccountService {
     let player = await this.players.findOne({ where: { profileId } });
     let issuedToken: string | undefined;
     if (!player) {
+      if (rawToken) throw new InvalidAccountTokenError();
       issuedToken = randomBytes(32).toString('hex');
       player = this.players.create({ profileId, displayName, accountTokenHash: this.hash(issuedToken) });
       await this.players.save(player);
     } else {
-      if (!rawToken || this.hash(rawToken) !== player.accountTokenHash) throw new Error('Invalid account token');
-      player.displayName = displayName;
-      // A profile sync must not overwrite XP/rating committed since this row was read.
-      await this.players.update(player.id, { displayName });
+      if (!rawToken || !this.tokenMatches(rawToken, player.accountTokenHash)) throw new InvalidAccountTokenError();
     }
     return { player, issuedToken };
+  }
+
+  async updateDisplayName(playerId: string, displayName: string) {
+    await this.players.update(playerId, { displayName });
   }
 
   async recordMatch(input: { matchId: string; hostId?: string; guestId?: string; hostName: string; guestName: string; winnerId?: string; difficulty: string; finishReason: 'normal'|'forfeit'; hostHp: number; guestHp: number; startedAt: Date; matchType: 'RANKED'|'UNRANKED' }) {
@@ -97,4 +101,9 @@ export class AccountService {
   private async position(player: PlayerEntity) { const all = await this.players.find({ order: { rating: 'DESC', wins: 'DESC', losses: 'ASC', createdAt: 'ASC', id: 'ASC' } }); return all.findIndex(item => item.id === player.id) + 1; }
 
   private hash(value: string) { return createHash('sha256').update(value).digest('hex'); }
+  private tokenMatches(rawToken: string, storedHash: string) {
+    const supplied = Buffer.from(this.hash(rawToken), 'hex');
+    const stored = Buffer.from(storedHash, 'hex');
+    return supplied.length === stored.length && timingSafeEqual(supplied, stored);
+  }
 }
