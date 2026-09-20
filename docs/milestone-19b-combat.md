@@ -1,5 +1,8 @@
 # Milestone 19B combat asset contract
 
+> Historical 19B contract. Milestone 19C replacements, quality status and presentation-audio
+> timing are documented in `docs/milestone-19c-assets.md`.
+
 All artwork in `combat.png` is ORIGINAL TEMPORARY PROCEDURAL ART, not final production artwork.
 Generated offline by `tools/generate-combat-assets.ps1` using Windows System.Drawing. No downloaded
 characters, runtime downloads, new dependencies, audio assets or gameplay changes.

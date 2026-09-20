@@ -35,7 +35,6 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -227,7 +226,9 @@ private fun MatchHistoryCard(match: ProfileMatchStat) {
 
 @Composable
 private fun ResultBadge(text: String, won: Boolean) {
-    Surface(color = if (won) Color(0xFF1B5E20) else Color(0xFFB3261E), contentColor = Color.White,
+    Surface(
+        color = if (won) MaterialTheme.colorScheme.tertiaryContainer else MaterialTheme.colorScheme.errorContainer,
+        contentColor = if (won) MaterialTheme.colorScheme.onTertiaryContainer else MaterialTheme.colorScheme.onErrorContainer,
         shape = RoundedCornerShape(50)) {
         Text(text, Modifier.padding(horizontal = 10.dp, vertical = 4.dp), style = MaterialTheme.typography.labelMedium,
             fontWeight = FontWeight.Bold)

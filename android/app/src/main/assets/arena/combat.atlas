@@ -348,42 +348,63 @@ arena/background
   index: -1
 arena/platform
   rotate: false
-  xy: 1010, 1540
+  xy: 1010, 1538
   size: 1000, 120
   orig: 1000, 120
   offset: 0, 0
   index: -1
-fx/shadow
+fx/projectile
   rotate: false
-  xy: 1010, 1680
-  size: 128, 48
-  orig: 128, 48
-  offset: 0, 0
-  index: -1
-fx/glow
-  rotate: false
-  xy: 1150, 1680
+  xy: 1010, 1670
   size: 128, 128
   orig: 128, 128
   offset: 0, 0
   index: -1
-fx/projectile
+fx/glow
   rotate: false
-  xy: 1290, 1680
-  size: 64, 64
-  orig: 64, 64
+  xy: 1142, 1670
+  size: 128, 128
+  orig: 128, 128
   offset: 0, 0
   index: -1
 fx/impact
   rotate: false
-  xy: 1370, 1680
-  size: 64, 64
-  orig: 64, 64
+  xy: 1274, 1670
+  size: 128, 128
+  orig: 128, 128
+  offset: 0, 0
+  index: -1
+fx/burst
+  rotate: false
+  xy: 1010, 1802
+  size: 128, 128
+  orig: 128, 128
+  offset: 0, 0
+  index: -1
+fx/spark
+  rotate: false
+  xy: 1142, 1802
+  size: 128, 128
+  orig: 128, 128
+  offset: 0, 0
+  index: -1
+fx/victory
+  rotate: false
+  xy: 1274, 1802
+  size: 128, 128
+  orig: 128, 128
+  offset: 0, 0
+  index: -1
+fx/shadow
+  rotate: false
+  xy: 1410, 1670
+  size: 128, 48
+  orig: 128, 48
   offset: 0, 0
   index: -1
 fx/paused
   rotate: false
-  xy: 1450, 1680
+  xy: 1550, 1670
   size: 64, 64
   orig: 64, 64
   offset: 0, 0

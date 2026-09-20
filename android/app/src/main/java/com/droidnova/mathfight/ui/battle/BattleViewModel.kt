@@ -155,7 +155,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     private var consumedArenaKo: PhaseKey? = null
 
     enum class ConnectionStatus { IDLE, CONNECTING, CONNECTED, DISCONNECTED, ERROR }
-    private val mutableServerUrl = MutableStateFlow("http://192.168.1.7:3000")
+    private val mutableServerUrl = MutableStateFlow("http://192.168.1.5:3000")
     val serverUrl = mutableServerUrl.asStateFlow()
     private val mutableConnectionStatus = MutableStateFlow(ConnectionStatus.IDLE)
     val connectionStatus = mutableConnectionStatus.asStateFlow()

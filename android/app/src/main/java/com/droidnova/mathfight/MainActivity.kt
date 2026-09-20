@@ -23,10 +23,12 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import com.droidnova.mathfight.profile.ProfileStore
 import com.droidnova.mathfight.profile.ProfileScreen
 import com.droidnova.mathfight.ui.battle.CombatAudio
+import com.droidnova.mathfight.ui.battle.CombatSound
 import com.droidnova.mathfight.ui.battle.FeedbackKind
 import com.droidnova.mathfight.ui.battle.arena.ActivityArenaHost
 import com.droidnova.mathfight.ui.battle.arena.ArenaHostProvider
 import com.droidnova.mathfight.ui.battle.arena.ArenaCommandBridge
+import com.droidnova.mathfight.ui.battle.arena.ArenaPresentationCue
 import com.droidnova.mathfight.ui.battle.arena.BattleExitCoordinator
 import com.badlogic.gdx.backends.android.AndroidFragmentApplication
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -62,6 +64,15 @@ class MainActivity : FragmentActivity(), AndroidFragmentApplication.Callbacks, A
         setContentView(root)
         arenaHost = ActivityArenaHost(this, root, composeView, arenaContainer, arenaCommandBridge)
         battleExitCoordinator = BattleExitCoordinator(arenaHost)
+        arenaCommandBridge.setPresentationListener { event ->
+            if (lifecycle.currentState != Lifecycle.State.RESUMED ||
+                battleViewModel.onlinePaused.value) return@setPresentationListener
+            val currentSettings = battleViewModel.settings.value
+            if (currentSettings.sound) audio.play(event.cue.toCombatSound())
+            if (event.cue == ArenaPresentationCue.IMPACT && currentSettings.vibration) {
+                root.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
+            }
+        }
         composeView.setContent {
             val state by battleViewModel.state.collectAsStateWithLifecycle()
             val profile by battleViewModel.profile.collectAsStateWithLifecycle()
@@ -103,8 +114,9 @@ class MainActivity : FragmentActivity(), AndroidFragmentApplication.Callbacks, A
                         battleViewModel.feedback.collect { event ->
                             if (lifecycle.currentState != Lifecycle.State.RESUMED ||
                                 !battleViewModel.consumeFeedback(event)) return@collect
+                            if (arenaCommandBridge.canPresentFeedback(arenaHost.session)) return@collect
                             val currentSettings = battleViewModel.settings.value
-                            if (currentSettings.sound) audio.play(event.kind)
+                            if (currentSettings.sound) audio.playImmediate(event.kind)
                             if (event.kind == FeedbackKind.HIT) {
                                 if (currentSettings.vibration) {
                                     view.performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
@@ -217,6 +229,7 @@ class MainActivity : FragmentActivity(), AndroidFragmentApplication.Callbacks, A
     }
 
     override fun onDestroy() {
+        arenaCommandBridge.setPresentationListener(null)
         audio.release()
         super.onDestroy()
         arenaHost.destroy()
@@ -243,4 +256,14 @@ class MainActivity : FragmentActivity(), AndroidFragmentApplication.Callbacks, A
     }
 
     companion object { private const val LOCAL_NETWORK_REQUEST = 7301 }
+}
+
+private fun ArenaPresentationCue.toCombatSound(): CombatSound = when (this) {
+    ArenaPresentationCue.MELEE_SWING -> CombatSound.MELEE_SWING
+    ArenaPresentationCue.ENERGY_CHARGE -> CombatSound.ENERGY_CHARGE
+    ArenaPresentationCue.PROJECTILE_LAUNCH -> CombatSound.PROJECTILE_LAUNCH
+    ArenaPresentationCue.IMPACT -> CombatSound.IMPACT
+    ArenaPresentationCue.HIT_REACTION -> CombatSound.HIT_REACTION
+    ArenaPresentationCue.KO_POWER_DOWN -> CombatSound.KO_POWER_DOWN
+    ArenaPresentationCue.VICTORY -> CombatSound.VICTORY
 }

@@ -1,128 +1,153 @@
-# Original temporary vector-style artwork, rasterized offline with Windows System.Drawing.
-# Run from repository root. No external assets or dependencies. Not production artwork.
+# Packages original project artwork into the fixed Milestone 19B libGDX atlas contract.
+# Source images are retained outside the APK under docs/art-source for reproducible packaging.
 Add-Type -AssemblyName System.Drawing
 $ErrorActionPreference = 'Stop'
+
+$source = Join-Path $PSScriptRoot '../docs/art-source'
 $destination = Join-Path $PSScriptRoot '../android/app/src/main/assets/arena'
-$bitmap = New-Object Drawing.Bitmap 2048,2048
-$g = [Drawing.Graphics]::FromImage($bitmap)
-$g.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::AntiAlias
-$g.Clear([Drawing.Color]::Transparent)
-$atlas = New-Object Text.StringBuilder
-[void]$atlas.AppendLine("combat.png`nsize: 2048, 2048`nformat: RGBA8888`nfilter: Linear, Linear`nrepeat: none")
-function Region($name, $x, $y, $w, $h, $index = -1) {
-    [void]$atlas.AppendLine("$name`n  rotate: false`n  xy: $x, $y`n  size: $w, $h`n  orig: $w, $h`n  offset: 0, 0`n  index: $index")
+$atlasBitmap = New-Object Drawing.Bitmap 2048, 2048, ([Drawing.Imaging.PixelFormat]::Format32bppArgb)
+$graphics = [Drawing.Graphics]::FromImage($atlasBitmap)
+$graphics.Clear([Drawing.Color]::Transparent)
+$graphics.CompositingMode = [Drawing.Drawing2D.CompositingMode]::SourceCopy
+$graphics.CompositingQuality = [Drawing.Drawing2D.CompositingQuality]::HighQuality
+$graphics.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+$graphics.PixelOffsetMode = [Drawing.Drawing2D.PixelOffsetMode]::Half
+$graphics.SmoothingMode = [Drawing.Drawing2D.SmoothingMode]::HighQuality
+
+$descriptor = New-Object Text.StringBuilder
+[void]$descriptor.AppendLine("combat.png`nsize: 2048, 2048`nformat: RGBA8888`nfilter: Linear, Linear`nrepeat: none")
+
+function Add-Region($name, $x, $y, $width, $height, $index = -1) {
+    [void]$descriptor.AppendLine("$name`n  rotate: false`n  xy: $x, $y`n  size: $width, $height`n  orig: $width, $height`n  offset: 0, 0`n  index: $index")
 }
-function Brush($color) { New-Object Drawing.SolidBrush ([Drawing.ColorTranslator]::FromHtml($color)) }
-function Rect($color, [single]$x,[single]$y,[single]$w,[single]$h) {
-    $b = Brush $color; $g.FillRectangle($b,$x,$y,$w,$h); $b.Dispose()
+
+function Draw-SourceRegion($image, $sourceRectangle, $destinationRectangle) {
+    $graphics.DrawImage(
+        $image,
+        $destinationRectangle,
+        $sourceRectangle.X,
+        $sourceRectangle.Y,
+        $sourceRectangle.Width,
+        $sourceRectangle.Height,
+        [Drawing.GraphicsUnit]::Pixel
+    )
 }
-function Oval($color, [single]$x,[single]$y,[single]$w,[single]$h) {
-    $b = Brush $color; $g.FillEllipse($b,$x,$y,$w,$h); $b.Dispose()
-}
-function Line($color,[single]$width,[single]$x1,[single]$y1,[single]$x2,[single]$y2) {
-    $p = New-Object Drawing.Pen ([Drawing.ColorTranslator]::FromHtml($color)), $width
-    $p.StartCap = 'Round'; $p.EndCap = 'Round'; $g.DrawLine($p,$x1,$y1,$x2,$y2); $p.Dispose()
-}
-# 48 robot cells, transparent 256 square; all poses share foot anchor (128,240).
-$states = @('idle','melee','projectile','hit','ko','victory')
-for ($side=0; $side -lt 2; $side++) {
-    $body = if ($side -eq 0) { '#21ABEF' } else { '#FA6847' }
-    $light = if ($side -eq 0) { '#9AFAFF' } else { '#FFE29A' }
-    $prefix = if ($side -eq 0) { 'blue' } else { 'red' }
-    for ($state=0; $state -lt 6; $state++) {
-        for ($frame=0; $frame -lt 4; $frame++) {
-            $cell = $side*24 + $state*4 + $frame
-            $x=($cell%8)*256; $y=[math]::Floor($cell/8)*256
-            Region "$prefix/$($states[$state])" ($x+2) ($y+2) 252 252 $frame
-            $saved=$g.Save(); $g.TranslateTransform($x+2,$y+2)
-            if ($side -eq 1) { $g.TranslateTransform(252,0); $g.ScaleTransform(-1,1) }
-            if ($state -eq 4) {
-                $g.TranslateTransform(126,180)
-                $g.RotateTransform(-($frame/3)*78)
-                $g.ScaleTransform((1-$frame*0.06),(1-$frame*0.06))
-                $g.TranslateTransform(-126,-180)
+
+function Feather-CellEdges($bitmap) {
+    $rectangle = [Drawing.Rectangle]::new(0, 0, $bitmap.Width, $bitmap.Height)
+    $data = $bitmap.LockBits($rectangle, [Drawing.Imaging.ImageLockMode]::ReadWrite,
+        [Drawing.Imaging.PixelFormat]::Format32bppArgb)
+    try {
+        $bytes = New-Object byte[] ([math]::Abs($data.Stride) * $bitmap.Height)
+        [Runtime.InteropServices.Marshal]::Copy($data.Scan0, $bytes, 0, $bytes.Length)
+        for ($y = 0; $y -lt $bitmap.Height; $y++) {
+            for ($x = 0; $x -lt $bitmap.Width; $x++) {
+                $edge = [math]::Min([math]::Min($x, $bitmap.Width - 1 - $x),
+                    [math]::Min($y, $bitmap.Height - 1 - $y))
+                if ($edge -lt 8) {
+                    $alpha = $y * $data.Stride + $x * 4 + 3
+                    $bytes[$alpha] = [byte]($bytes[$alpha] * $edge / 8)
+                }
             }
-            $bob = if ($state -eq 0) { @(0,-2,0,2)[$frame] } else { 0 }
-            $g.TranslateTransform(0,$bob)
-            $outline='#10263D'
-            Line $outline 22 108 188 101 230
-            Line $outline 22 145 188 153 230
-            Rect $outline 84 224 34 16; Rect $outline 140 224 34 16
-            Rect $light 89 227 25 7; Rect $light 144 227 25 7
-            # Friendly rounded capsule body and bright chest core.
-            Oval $outline 77 97 100 110; Rect $outline 77 128 100 48
-            Oval $body 84 103 86 98; Rect $body 84 128 86 45
-            Oval $outline 103 129 48 48; Oval $light 110 136 34 34
-            Oval '#FFFFFF' 116 139 10 10
-            $frontX=181; $frontY=150; $backY=159
-            if ($state -eq 1) { $frontX=@(171,203,222,183)[$frame]; $frontY=@(145,126,130,151)[$frame] }
-            if ($state -eq 2) { $frontX=@(168,183,196,181)[$frame]; $frontY=139 }
-            if ($state -eq 5) { $frontX=181; $frontY=@(135,98,61,59)[$frame]; $backY=$frontY }
-            Line $outline 25 83 126 62 $backY; Line $body 15 83 126 62 $backY
-            Line $outline 27 170 126 $frontX $frontY; Line $body 17 170 126 $frontX $frontY
-            Oval $outline ($frontX-15) ($frontY-14) 31 30; Oval $light ($frontX-10) ($frontY-9) 21 20
-            # Head, antenna, inset visor and two expressive eyes.
-            Line $outline 7 127 50 127 34; Oval $light 120 26 14 14
-            Oval $outline 77 48 100 74; Rect $outline 77 78 100 20
-            Oval $body 84 54 86 60; Rect $body 84 78 86 17
-            Rect $outline 91 70 68 26
-            if ($state -eq 4 -and $frame -gt 0) {
-                Line '#718392' 4 103 79 114 87; Line '#718392' 4 114 79 103 87
-                Line '#718392' 4 135 79 146 87; Line '#718392' 4 146 79 135 87
-                Oval '#506477' 110 136 34 34
-            } else {
-                Rect $light 104 76 11 13; Rect $light 137 76 11 13
-                Line $outline 3 118 102 137 102
-            }
-            $g.Restore($saved)
         }
+        [Runtime.InteropServices.Marshal]::Copy($bytes, 0, $data.Scan0, $bytes.Length)
+    } finally {
+        $bitmap.UnlockBits($data)
     }
 }
-# Two arena layers at native world aspect; quiet upper area keeps silhouettes readable.
-Region 'arena/background' 2 1538 1000 500
-$saved=$g.Save(); $g.TranslateTransform(2,1538)
-for ($band=0; $band -lt 50; $band++) {
-    $b = New-Object Drawing.SolidBrush ([Drawing.Color]::FromArgb(255, (12+$band/5), (24+$band/3), (49+$band/2)))
-    $g.FillRectangle($b,0,($band*10),1000,10); $b.Dispose()
+
+function Draw-FighterSheet($file, $prefix, $firstCell) {
+    $image = [Drawing.Image]::FromFile((Join-Path $source $file))
+    try {
+        if ($image.Width -ne 1024 -or $image.Height -ne 1536) {
+            throw "$file must remain 1024 x 1536 (four columns by six rows)."
+        }
+        $animations = @('idle', 'melee', 'projectile', 'hit', 'ko', 'victory')
+        for ($row = 0; $row -lt 6; $row++) {
+            for ($frame = 0; $frame -lt 4; $frame++) {
+                $cell = $firstCell + $row * 4 + $frame
+                $x = ($cell % 8) * 256 + 2
+                $y = [math]::Floor($cell / 8) * 256 + 2
+                Add-Region "$prefix/$($animations[$row])" $x $y 252 252 $frame
+                $cell = New-Object Drawing.Bitmap 256, 256, ([Drawing.Imaging.PixelFormat]::Format32bppArgb)
+                $cellGraphics = [Drawing.Graphics]::FromImage($cell)
+                $cellGraphics.CompositingMode = [Drawing.Drawing2D.CompositingMode]::SourceCopy
+                $cellGraphics.DrawImage($image, 0, 0,
+                    [Drawing.Rectangle]::new($frame * 256, $row * 256, 256, 256),
+                    [Drawing.GraphicsUnit]::Pixel)
+                $cellGraphics.Dispose()
+                # Fade only the outer eight source pixels, then add an eight-pixel atlas inset.
+                # This removes hard generated-sheet seams without borrowing a neighbouring pose.
+                Feather-CellEdges $cell
+                Draw-SourceRegion $cell ([Drawing.Rectangle]::new(0, 0, 256, 256)) `
+                    ([Drawing.Rectangle]::new($x + 8, $y + 8, 236, 236))
+                $cell.Dispose()
+            }
+        }
+    } finally {
+        $image.Dispose()
+    }
 }
-for ($tower=0; $tower -lt 10; $tower++) {
-    $tx=$tower*108-24; $ty=130+($tower%3)*32
-    Rect '#203954' $tx $ty 76 (420-$ty)
-    Rect '#2A4963' ($tx+5) ($ty+7) 4 (400-$ty)
-    for ($window=0; $window -lt 4; $window++) { Rect '#41647C' ($tx+17) ($ty+24+$window*32) 29 4 }
+
+Draw-FighterSheet 'blue-robot-sheet-source.png' 'blue' 0
+Draw-FighterSheet 'red-robot-sheet-source.png' 'red' 24
+
+$background = [Drawing.Image]::FromFile((Join-Path $source 'arena-background-source.png'))
+try {
+    Add-Region 'arena/background' 2 1538 1000 500
+    Draw-SourceRegion $background ([Drawing.Rectangle]::new(0, 0, $background.Width, $background.Height)) `
+        ([Drawing.Rectangle]::new(2, 1538, 1000, 500))
+} finally {
+    $background.Dispose()
 }
-Line '#37607C' 5 0 376 1000 376
-Line '#6198AA' 2 0 383 1000 383
-$g.Restore($saved)
-Region 'arena/platform' 1010 1540 1000 120
-$saved=$g.Save(); $g.TranslateTransform(1010,1540); $g.SetClip([Drawing.Rectangle]::new(0,0,1000,120))
-Rect '#213B52' 0 0 1000 120
-Line '#6AE4EE' 5 15 12 985 12
-Line '#12273C' 12 0 40 1000 40
-for ($panel=0; $panel -lt 10; $panel++) {
-    Line '#36566F' 2 ($panel*100) 45 ($panel*100-35) 120
-    Rect '#4A93AA' ($panel*100+12) 55 26 5
+
+$platform = [Drawing.Image]::FromFile((Join-Path $source 'arena-platform-source.png'))
+try {
+    Add-Region 'arena/platform' 1010 1538 1000 120
+    # The source already uses transparent margins; the full image preserves its authored edge glow.
+    Draw-SourceRegion $platform ([Drawing.Rectangle]::new(0, 0, $platform.Width, $platform.Height)) `
+        ([Drawing.Rectangle]::new(1010, 1538, 1000, 120))
+} finally {
+    $platform.Dispose()
 }
-$g.Restore($saved)
-Region 'fx/shadow' 1010 1680 128 48
-Oval '#102239' 1012 1682 124 44
-Region 'fx/glow' 1150 1680 128 128
-for ($ring=0; $ring -lt 12; $ring++) {
-    $b=New-Object Drawing.SolidBrush ([Drawing.Color]::FromArgb(8+$ring*2,255,255,255))
-    $g.FillEllipse($b,(1152+$ring*4),(1682+$ring*4),(124-$ring*8),(124-$ring*8)); $b.Dispose()
+
+$effects = [Drawing.Image]::FromFile((Join-Path $source 'combat-effects-source.png'))
+try {
+    $effectNames = @('projectile', 'glow', 'impact', 'burst', 'spark', 'victory')
+    for ($index = 0; $index -lt $effectNames.Count; $index++) {
+        $column = $index % 3
+        $row = [math]::Floor($index / 3)
+        $x = 1010 + $column * 132
+        $y = 1670 + $row * 132
+        Add-Region "fx/$($effectNames[$index])" $x $y 128 128
+        Draw-SourceRegion $effects ([Drawing.Rectangle]::new($column * 512, $row * 512, 512, 512)) `
+            ([Drawing.Rectangle]::new($x, $y, 128, 128))
+    }
+} finally {
+    $effects.Dispose()
 }
-Region 'fx/projectile' 1290 1680 64 64
-Oval '#B2EDFF' 1293 1683 58 58; Oval '#FFFFFF' 1301 1691 42 42
-Region 'fx/impact' 1370 1680 64 64
-Line '#FFFFFF' 8 1402 1687 1402 1737
-Line '#FFFFFF' 8 1377 1712 1427 1712
-Line '#FFFFFF' 5 1385 1695 1419 1729
-Line '#FFFFFF' 5 1385 1729 1419 1695
-Region 'fx/paused' 1450 1680 64 64
-Oval '#10263D' 1452 1682 60 60
-Rect '#9AFAFF' 1469 1696 9 32
-Rect '#9AFAFF' 1487 1696 9 32
-$g.Dispose()
-$bitmap.Save((Join-Path $destination 'combat.png'),[Drawing.Imaging.ImageFormat]::Png)
-$bitmap.Dispose()
-[IO.File]::WriteAllText((Join-Path $destination 'combat.atlas'),$atlas.ToString())
+
+# Small deterministic utility sprites share the production palette and avoid extra source files.
+Add-Region 'fx/shadow' 1410 1670 128 48
+$shadowPath = New-Object Drawing.Drawing2D.GraphicsPath
+$shadowPath.AddEllipse(1412, 1674, 124, 40)
+$shadowBrush = New-Object Drawing.Drawing2D.PathGradientBrush $shadowPath
+$shadowBrush.CenterColor = [Drawing.Color]::FromArgb(145, 2, 10, 24)
+$shadowBrush.SurroundColors = @([Drawing.Color]::Transparent)
+$graphics.FillPath($shadowBrush, $shadowPath)
+$shadowBrush.Dispose()
+$shadowPath.Dispose()
+
+Add-Region 'fx/paused' 1550 1670 64 64
+$pauseGlow = New-Object Drawing.SolidBrush ([Drawing.Color]::FromArgb(190, 18, 37, 64))
+$pauseBar = New-Object Drawing.SolidBrush ([Drawing.Color]::FromArgb(255, 118, 242, 255))
+$graphics.FillEllipse($pauseGlow, 1552, 1672, 60, 60)
+$graphics.FillRectangle($pauseBar, 1568, 1686, 9, 34)
+$graphics.FillRectangle($pauseBar, 1587, 1686, 9, 34)
+$pauseGlow.Dispose()
+$pauseBar.Dispose()
+
+$graphics.Dispose()
+$atlasBitmap.Save((Join-Path $destination 'combat.png'), [Drawing.Imaging.ImageFormat]::Png)
+$atlasBitmap.Dispose()
+[IO.File]::WriteAllText((Join-Path $destination 'combat.atlas'), $descriptor.ToString())

@@ -13,27 +13,45 @@ internal class BattleArenaRenderer(
     private val assets = ArenaAssets()
     private val camera = ArenaCamera()
     private val effects = ArenaEffects()
+    private val fallback = ArenaFallbackRenderer()
     private val fighters = Array(2) { FighterVisualState(ArenaSide.entries[it]) }
     // One reusable flight/impact slot per side. A hit is armed only by authoritative damage.
     private class Strike {
         var question = Long.MIN_VALUE
         var pendingHit = false
-        fun reset() { question = Long.MIN_VALUE; pendingHit = false }
+        var launchPlayed = false
+        var attackEvent: ArenaEventId? = null
+        var contactEvent: ArenaEventId? = null
+        fun reset() {
+            question = Long.MIN_VALUE
+            pendingHit = false
+            launchPlayed = false
+            attackEvent = null
+            contactEvent = null
+        }
     }
     private val strikes = Array(2) { Strike() }
     private val highWater = LongArray(ArenaEventKind.entries.size) { Long.MIN_VALUE }
     private var battleId = Long.MIN_VALUE
     private var winner: ArenaSide? = null
+    private var pendingKoEvent: ArenaEventId? = null
+    private var pendingVictoryEvent: ArenaEventId? = null
     private var paused = false
     private var initialized = false
     private var disposed = false
     private var elapsed = 0f
 
     override fun create() {
-        try { assets.load(); initialized = true }
+        try {
+            assets.load()
+            initialized = true
+            Gdx.gl.glEnable(GL20.GL_BLEND)
+            Gdx.gl.glBlendFunc(GL20.GL_SRC_ALPHA, GL20.GL_ONE_MINUS_SRC_ALPHA)
+        }
         catch (exception: Exception) {
-            Gdx.app.error("BattleArenaRenderer", "Arena assets unavailable", exception)
+            Gdx.app.debug("BattleArenaRenderer", "Arena GPU resources unavailable", exception)
             assets.dispose()
+            bridge.detach(this)
         }
         Gdx.graphics.setContinuousRendering(true)
     }
@@ -47,7 +65,10 @@ internal class BattleArenaRenderer(
         for (command in bridge.drain(session)) applyCommand(command)
         Gdx.gl.glClearColor(0.025f, 0.045f, 0.09f, 1f)
         Gdx.gl.glClear(GL20.GL_COLOR_BUFFER_BIT)
-        if (!initialized) return
+        if (!initialized) {
+            bridge.detach(this)
+            return
+        }
         val delta = if (paused) 0f else Gdx.graphics.deltaTime.coerceIn(0f, 0.05f)
         try {
             update(delta)
@@ -55,6 +76,7 @@ internal class BattleArenaRenderer(
         } catch (exception: Exception) {
             Gdx.app.error("BattleArenaRenderer", "Arena render unavailable", exception)
             initialized = false
+            bridge.detach(this)
             assets.dispose()
         }
     }
@@ -82,17 +104,32 @@ internal class BattleArenaRenderer(
                 if (f.play(action)) {
                     strikes[command.side.ordinal].reset()
                     strikes[command.side.ordinal].question = command.eventId.questionId
+                    strikes[command.side.ordinal].attackEvent = command.eventId
+                    bridge.emitPresentation(
+                        session,
+                        command.eventId,
+                        if (action == FighterAction.ATTACK_MELEE) ArenaPresentationCue.MELEE_SWING
+                        else ArenaPresentationCue.ENERGY_CHARGE
+                    )
                 }
             }
             is ArenaCommand.Hit -> if (consume(command.eventId)) {
                 val attacker = command.side.opposite.ordinal
                 val strike = strikes[attacker]
                 if (strike.question == command.eventId.questionId && fighters[attacker].attacking &&
-                    fighters[attacker].time < fighters[attacker].contactTime) strike.pendingHit = true
-                else impact(command.side)
+                    fighters[attacker].time < fighters[attacker].contactTime) {
+                    strike.pendingHit = true
+                    strike.contactEvent = command.eventId
+                } else impact(command.side, command.eventId)
             }
-            is ArenaCommand.Ko -> if (consume(command.eventId)) finishWhenReady(command.side.opposite)
-            is ArenaCommand.Victory -> if (consume(command.eventId)) finishWhenReady(command.side)
+            is ArenaCommand.Ko -> if (consume(command.eventId)) {
+                pendingKoEvent = command.eventId
+                finishWhenReady(command.side.opposite)
+            }
+            is ArenaCommand.Victory -> if (consume(command.eventId)) {
+                pendingVictoryEvent = command.eventId
+                finishWhenReady(command.side)
+            }
             is ArenaCommand.PrepareExit -> {
                 paused = true
                 bridge.acknowledgeExitPrepared(session, command.token)
@@ -107,6 +144,7 @@ internal class BattleArenaRenderer(
             for (s in strikes) s.reset()
             highWater.fill(Long.MIN_VALUE)
             effects.clear(); camera.reset(); elapsed = 0f; winner = null
+            pendingKoEvent = null; pendingVictoryEvent = null
         }
         // A resumed authoritative snapshot may have advanced while this renderer was waiting.
         // Drop unfinished strikes for earlier questions; never replay them after reconnect.
@@ -127,7 +165,7 @@ internal class BattleArenaRenderer(
             if (fresh || resuming) {
                 fighters[it.ordinal].restore(FighterAction.VICTORY)
                 fighters[it.opposite.ordinal].restore(FighterAction.KO)
-            } else finishWhenReady(it)
+            }
         }
         // ANSWERING must not truncate the independent 650/800 ms visual sequence.
     }
@@ -135,14 +173,27 @@ internal class BattleArenaRenderer(
         winner = side
         if (strikes.any { it.pendingHit }) return
         val loser = fighters[side.opposite.ordinal]
-        if (loser.play(FighterAction.KO)) effects.burst(baseX(loser.side), 170f)
-        fighters[side.ordinal].play(FighterAction.VICTORY)
+        val koEvent = pendingKoEvent
+        if (koEvent != null && loser.play(FighterAction.KO)) {
+            effects.spawnKoSparks(baseX(loser.side), 170f, loser.side)
+            bridge.emitPresentation(session, koEvent, ArenaPresentationCue.KO_POWER_DOWN)
+        }
+        val victoryEvent = pendingVictoryEvent
+        if (victoryEvent != null && fighters[side.ordinal].play(FighterAction.VICTORY)) {
+            bridge.emitPresentation(session, victoryEvent, ArenaPresentationCue.VICTORY)
+        }
     }
-    private fun impact(side: ArenaSide) {
+    private fun impact(side: ArenaSide, eventId: ArenaEventId) {
         if (fighters[side.ordinal].terminal) return
         fighters[side.ordinal].play(FighterAction.HIT)
-        effects.burst(baseX(side) + fighters[side.ordinal].direction * 45f, 225f)
+        effects.spawnImpact(
+            baseX(side) + fighters[side.ordinal].direction * 45f,
+            225f,
+            side.opposite
+        )
         camera.shake()
+        bridge.emitPresentation(session, eventId, ArenaPresentationCue.IMPACT)
+        bridge.emitPresentation(session, eventId, ArenaPresentationCue.HIT_REACTION)
     }
     private fun update(delta: Float) {
         if (delta <= 0f) return
@@ -152,15 +203,25 @@ internal class BattleArenaRenderer(
             val f = fighters[index]
             val strike = strikes[index]
             f.update(delta)
+            if (f.pose == FighterAction.ATTACK_PROJECTILE && f.time >= 0.20f && !strike.launchPlayed) {
+                strike.launchPlayed = true
+                strike.attackEvent?.let {
+                    bridge.emitPresentation(session, it, ArenaPresentationCue.PROJECTILE_LAUNCH)
+                }
+            }
             if (strike.pendingHit && (!f.attacking || f.time >= f.contactTime)) {
                 strike.pendingHit = false
-                impact(f.side.opposite)
+                strike.contactEvent?.let { impact(f.side.opposite, it) }
             }
         }
         winner?.let { finishWhenReady(it) }
         camera.update(delta)
     }
     private fun draw() {
+        if (!assets.artworkReady) {
+            fallback.draw(assets.shapes, camera, fighters, paused, elapsed)
+            return
+        }
         camera.apply()
         val batch = assets.batch
         batch.projectionMatrix = camera.camera.combined
@@ -175,21 +236,25 @@ internal class BattleArenaRenderer(
                 batch.draw(it, x - 75f, 75f, 150f + f.offsetY, 25f)
             }
             batch.setColor(1f, 1f - f.flash * 0.55f, 1f - f.flash * 0.55f, 1f)
-            batch.draw(assets.frame(f), x - 150f, 82f + f.offsetY, 150f, 0f,
+            batch.draw(assets.frame(f), x - 150f, 50f + f.offsetY, 150f, 0f,
                 300f, 300f, 1f, 1f, f.rotation)
             val glow = assets.glow
             if (glow != null) {
-                val victory = if (f.pose == FighterAction.VICTORY) 1f - f.progress else 0f
-                val size = if (victory > 0f) 100f + f.progress * 280f else 70f
-                val alpha = maxOf(f.charge, victory * 0.6f)
-                tint(f.side, alpha)
-                batch.draw(glow, x + f.direction * 80f - size / 2f, 225f - size / 2f, size, size)
+                tint(f.side, f.charge)
+                batch.draw(glow, x + f.direction * 80f - 35f, 190f, 70f, 70f)
                 tint(f.side, 0.10f + MathUtils.sin(elapsed * 2f) * 0.025f)
                 batch.draw(glow, baseX(f.side) - 95f, 60f, 190f, 40f)
             }
+            if (f.pose == FighterAction.VICTORY && f.progress < 0.72f) {
+                assets.victoryPulse?.let { pulse ->
+                    val size = 95f + f.progress * 310f
+                    tint(f.side, (1f - f.progress / 0.72f).coerceIn(0f, 1f) * 0.72f)
+                    batch.draw(pulse, x - size / 2f, 210f - size / 2f, size, size)
+                }
+            }
             drawProjectile(f)
         }
-        effects.draw(batch, assets.impact)
+        effects.draw(batch, assets.impact, assets.burst, assets.spark)
         batch.setColor(1f, 1f, 1f, 1f)
         if (paused) assets.pauseIcon?.let { batch.draw(it, 468f, 218f, 64f, 64f) }
         batch.end()
@@ -204,7 +269,18 @@ internal class BattleArenaRenderer(
         repeat(4) { trail ->
             val size = 42f - trail * 7f
             tint(f.side, 1f - trail * 0.24f)
-            assets.batch.draw(region, x - f.direction * trail * 16f - size / 2f, 225f - size / 2f, size, size)
+            assets.batch.draw(
+                region,
+                x - f.direction * trail * 16f - size / 2f,
+                225f - size / 2f,
+                size / 2f,
+                size / 2f,
+                size,
+                size,
+                f.direction,
+                1f,
+                0f
+            )
         }
     }
     private fun tint(side: ArenaSide, alpha: Float) {

@@ -1,20 +1,35 @@
 package com.droidnova.mathfight.ui.battle
 
 import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -30,12 +45,16 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.droidnova.mathfight.R
 import com.droidnova.mathfight.game.BattlePhase
 import com.droidnova.mathfight.game.BattleState
 import com.droidnova.mathfight.game.Difficulty
@@ -45,7 +64,24 @@ import com.droidnova.mathfight.game.PhaseKey
 import com.droidnova.mathfight.profile.ProfileStats
 import com.droidnova.mathfight.profile.XpResult
 import com.droidnova.mathfight.profile.XpResultPanel
+import com.droidnova.mathfight.ui.components.AnimatedXpBar
+import com.droidnova.mathfight.ui.components.CompactStatisticChip
+import com.droidnova.mathfight.ui.components.ConnectionStatusIndicator
+import com.droidnova.mathfight.ui.components.ConnectionVisualState
+import com.droidnova.mathfight.ui.components.GameDifficultySelector
+import com.droidnova.mathfight.ui.components.GameLoadingState
+import com.droidnova.mathfight.ui.components.GameModeCard
+import com.droidnova.mathfight.ui.components.GameModeIcon
+import com.droidnova.mathfight.ui.components.GamePrimaryButton
+import com.droidnova.mathfight.ui.components.GameSecondaryButton
+import com.droidnova.mathfight.ui.components.InlineMessage
+import com.droidnova.mathfight.ui.components.PlayerAvatarBadge
+import com.droidnova.mathfight.ui.components.SectionHeading
 import com.droidnova.mathfight.ui.battle.arena.LibGdxBattleArena
+import com.droidnova.mathfight.ui.theme.GameDimensions
+import com.droidnova.mathfight.ui.theme.GamePrimary
+import com.droidnova.mathfight.ui.theme.GameSecondary
+import com.droidnova.mathfight.ui.theme.GameSuccess
 
 @Composable
 fun MathFightApp(
@@ -110,11 +146,36 @@ fun MathFightApp(
         onBack = when { leaderboardOpen -> onCloseLeaderboard; searchingWithoutRoom -> onCancelMatch; else -> onReturnHome })
     when (state.phase) {
         BattlePhase.HOME -> if (leaderboardOpen) LeaderboardScreen(leaderboard, onCloseLeaderboard)
-        else if (searchingWithoutRoom) SearchScreen(displayName, profileStats, search, onCancelMatch)
-        else HomeScreen(onStart, settings, onSound, onVibration,
-            debugConnection, serverUrl, connectionStatus, connectionMessage, onServerUrl, onConnect, onDisconnect,
-             roomCodeInput, room, roomError, onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom, onReady, onProfile, onFindMatch,
-             search.error, difficulty, onDifficulty, onLeaderboard)
+        else if (searchingWithoutRoom) MatchmakingScreen(displayName, profileStats, search, onCancelMatch)
+        else HomeScreen(
+            displayName = displayName,
+            profileStats = profileStats,
+            onStart = onStart,
+            settings = settings,
+            onSound = onSound,
+            onVibration = onVibration,
+            debugConnection = debugConnection,
+            serverUrl = serverUrl,
+            connectionStatus = connectionStatus,
+            connectionMessage = connectionMessage,
+            onServerUrl = onServerUrl,
+            onConnect = onConnect,
+            onDisconnect = onDisconnect,
+            roomCodeInput = roomCodeInput,
+            room = room,
+            roomError = roomError,
+            onRoomCode = onRoomCode,
+            onCreateRoom = onCreateRoom,
+            onJoinRoom = onJoinRoom,
+            onLeaveRoom = onLeaveRoom,
+            onReady = onReady,
+            onProfile = onProfile,
+            onFindMatch = onFindMatch,
+            searchError = search.error,
+            difficulty = difficulty,
+            onDifficulty = onDifficulty,
+            onLeaderboard = onLeaderboard
+        )
         else -> BattleScreen(
             state = state,
             exitInProgress = exitInProgress,
@@ -147,47 +208,294 @@ fun MathFightApp(
 }
 
 @Composable
-private fun HomeScreen(onStart: () -> Unit, settings: FeedbackSettings,
-                       onSound: (Boolean) -> Unit, onVibration: (Boolean) -> Unit,
-                       debugConnection: Boolean, serverUrl: String,
-                       connectionStatus: BattleViewModel.ConnectionStatus, connectionMessage: String,
-                       onServerUrl: (String) -> Unit, onConnect: () -> Unit, onDisconnect: () -> Unit,
-                       roomCodeInput: String, room: RoomInfo?, roomError: String,
-                       onRoomCode: (String) -> Unit, onCreateRoom: () -> Unit,
-                        onJoinRoom: () -> Unit, onLeaveRoom: () -> Unit, onReady: () -> Unit, onProfile: () -> Unit,
-                        onFindMatch: () -> Unit, searchError: String, difficulty: Difficulty,
-                        onDifficulty: (Difficulty) -> Unit, onLeaderboard: () -> Unit) {
-    Surface(modifier = Modifier.fillMaxSize()) {
-        Column(
-            modifier = Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(24.dp),
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Text("Math Fight", style = MaterialTheme.typography.displaySmall)
-            TextButton(onClick = onProfile, enabled = room?.matchActive != true) { Text("Profile") }
-            TextButton(onClick = onLeaderboard, enabled = room?.matchActive != true) { Text("Leaderboard") }
-            DifficultySelector(difficulty, onDifficulty)
-            if (debugConnection) {
-            ConnectionCheckPanel(serverUrl, connectionStatus, connectionMessage,
-                    onServerUrl, onConnect, onDisconnect, roomCodeInput, room, roomError,
-                    onRoomCode, onCreateRoom, onJoinRoom, onLeaveRoom, onReady, difficulty, onDifficulty)
-            }
-            Text(
-                "Solve. Strike. Win.",
-                modifier = Modifier.padding(top = 12.dp, bottom = 32.dp),
-                style = MaterialTheme.typography.titleMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant
+private fun HomeScreen(
+    displayName: String,
+    profileStats: ProfileStats?,
+    onStart: () -> Unit,
+    settings: FeedbackSettings,
+    onSound: (Boolean) -> Unit,
+    onVibration: (Boolean) -> Unit,
+    debugConnection: Boolean,
+    serverUrl: String,
+    connectionStatus: BattleViewModel.ConnectionStatus,
+    connectionMessage: String,
+    onServerUrl: (String) -> Unit,
+    onConnect: () -> Unit,
+    onDisconnect: () -> Unit,
+    roomCodeInput: String,
+    room: RoomInfo?,
+    roomError: String,
+    onRoomCode: (String) -> Unit,
+    onCreateRoom: () -> Unit,
+    onJoinRoom: () -> Unit,
+    onLeaveRoom: () -> Unit,
+    onReady: () -> Unit,
+    onProfile: () -> Unit,
+    onFindMatch: () -> Unit,
+    searchError: String,
+    difficulty: Difficulty,
+    onDifficulty: (Difficulty) -> Unit,
+    onLeaderboard: () -> Unit
+) {
+    val privateRoomVisible = rememberSaveable { mutableStateOf(room != null) }
+    val connectionSettingsVisible = rememberSaveable { mutableStateOf(false) }
+    val entered = remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { entered.value = true }
+    LaunchedEffect(room?.code) { if (room != null) privateRoomVisible.value = true }
+
+    BackHandler(enabled = room == null && connectionSettingsVisible.value) {
+        connectionSettingsVisible.value = false
+    }
+
+    val connectionVisualState = when (connectionStatus) {
+        BattleViewModel.ConnectionStatus.CONNECTED -> ConnectionVisualState.ONLINE
+        BattleViewModel.ConnectionStatus.CONNECTING -> ConnectionVisualState.CONNECTING
+        else -> ConnectionVisualState.OFFLINE
+    }
+    val onlineEnabled = connectionStatus == BattleViewModel.ConnectionStatus.CONNECTED && room == null
+    val onlineReason = when {
+        room != null -> "Leave the private room before matchmaking"
+        connectionStatus == BattleViewModel.ConnectionStatus.CONNECTING -> "Connecting to online play"
+        else -> "Connect to play online"
+    }
+
+    Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        if (privateRoomVisible.value || room != null) {
+            PrivateRoomFlow(
+                displayName = displayName,
+                status = connectionStatus,
+                difficulty = difficulty,
+                roomCodeInput = roomCodeInput,
+                room = room,
+                roomError = roomError,
+                onRoomCode = onRoomCode,
+                onCreateRoom = onCreateRoom,
+                onJoinRoom = onJoinRoom,
+                onReady = onReady,
+                onConnect = onConnect,
+                onDifficulty = onDifficulty,
+                onBack = {
+                    privateRoomVisible.value = false
+                    if (room != null) onLeaveRoom()
+                }
             )
-            Button(onClick = onStart, enabled = room == null, modifier = Modifier.heightIn(min = 48.dp)) {
-                Text("Start Battle")
+        } else AnimatedVisibility(
+            visible = entered.value,
+            enter = fadeIn(tween(GameDimensions.standardMotionMillis)),
+            exit = fadeOut(tween(GameDimensions.quickMotionMillis)),
+            modifier = Modifier.fillMaxSize()
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .safeDrawingPadding()
+                    .verticalScroll(rememberScrollState())
+                    .padding(horizontal = GameDimensions.screenPadding, vertical = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(GameDimensions.sectionSpacing)
+            ) {
+                HomeHeader(displayName, connectionVisualState, room?.matchActive != true, onProfile)
+                HomeHero()
+
+                Column(verticalArrangement = Arrangement.spacedBy(GameDimensions.itemSpacing)) {
+                    SectionHeading("Choose difficulty")
+                    GameDifficultySelector(difficulty, onDifficulty)
+                }
+
+                Column(verticalArrangement = Arrangement.spacedBy(GameDimensions.itemSpacing)) {
+                    SectionHeading("Choose your battle")
+                    GameModeCard(
+                        title = "Find Match",
+                        supportingText = "Battle a random opponent",
+                        icon = GameModeIcon.MATCH,
+                        accent = GamePrimary,
+                        enabled = onlineEnabled,
+                        disabledReason = onlineReason,
+                        prominent = true,
+                        onClick = onFindMatch,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    GameModeCard(
+                        title = "Play Offline",
+                        supportingText = "Train against the bot",
+                        icon = GameModeIcon.OFFLINE,
+                        accent = GameSuccess,
+                        enabled = room == null,
+                        disabledReason = "Leave the private room to train offline",
+                        onClick = onStart,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    GameModeCard(
+                        title = "Private Room",
+                        supportingText = "Create or join with a code",
+                        icon = GameModeIcon.ROOM,
+                        accent = GameSecondary,
+                        enabled = room?.matchActive != true,
+                        onClick = { privateRoomVisible.value = true },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    if (connectionVisualState == ConnectionVisualState.OFFLINE) {
+                        InlineMessage("Online battles are unavailable. Offline battle is ready to play.", isError = false)
+                        GameSecondaryButton(
+                            label = "Reconnect",
+                            onClick = onConnect,
+                            icon = GameModeIcon.MATCH,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    } else if (connectionVisualState == ConnectionVisualState.CONNECTING) {
+                        GameLoadingState("Connecting to online play")
+                    }
+                    InlineMessage(friendlyMatchmakingMessage(searchError))
+                }
+
+                PlayerProgressSection(profileStats, onProfile)
+
+                Column(verticalArrangement = Arrangement.spacedBy(GameDimensions.itemSpacing)) {
+                    SectionHeading("Explore")
+                    GameSecondaryButton(
+                        label = "Leaderboard",
+                        onClick = onLeaderboard,
+                        enabled = room?.matchActive != true,
+                        icon = GameModeIcon.LEADERBOARD,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    GameSecondaryButton(
+                        label = "Profile",
+                        onClick = onProfile,
+                        enabled = room?.matchActive != true,
+                        icon = GameModeIcon.PROFILE,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+
+                Column(verticalArrangement = Arrangement.spacedBy(GameDimensions.compactSpacing)) {
+                    SectionHeading("Preferences")
+                    FeedbackControls(settings, onSound, onVibration)
+                }
+
+                if (debugConnection) {
+                    GameSecondaryButton(
+                        label = if (connectionSettingsVisible.value) "Hide connection settings" else "Connection settings",
+                        onClick = { connectionSettingsVisible.value = !connectionSettingsVisible.value },
+                        icon = GameModeIcon.SETTINGS,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    AnimatedVisibility(connectionSettingsVisible.value) {
+                        ConnectionSettingsPanel(
+                            serverUrl = serverUrl,
+                            status = connectionStatus,
+                            message = connectionMessage,
+                            onServerUrl = onServerUrl,
+                            onConnect = onConnect,
+                            onDisconnect = onDisconnect
+                        )
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
             }
-            Button(onClick = onFindMatch, enabled = connectionStatus == BattleViewModel.ConnectionStatus.CONNECTED && room == null,
-                modifier = Modifier.padding(top = 8.dp).heightIn(min = 48.dp)) {
-                Text("Find Match")
+        }
+    }
+}
+
+@Composable
+private fun HomeHeader(
+    displayName: String,
+    connectionState: ConnectionVisualState,
+    profileEnabled: Boolean,
+    onProfile: () -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text("MATH FIGHT", style = MaterialTheme.typography.displaySmall, color = MaterialTheme.colorScheme.primary)
+                Text("Robot maths battles", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            if (searchError.isNotBlank()) Text(searchError, color = MaterialTheme.colorScheme.error,
-                style = MaterialTheme.typography.bodySmall)
-            FeedbackControls(settings, onSound, onVibration)
+            Spacer(Modifier.width(10.dp))
+            ConnectionStatusIndicator(connectionState)
+        }
+        PlayerAvatarBadge(
+            name = displayName,
+            onClick = onProfile,
+            enabled = profileEnabled,
+            modifier = Modifier.widthIn(max = 220.dp)
+        )
+    }
+}
+
+@Composable
+private fun HomeHero() {
+    Surface(
+        shape = MaterialTheme.shapes.large,
+        color = MaterialTheme.colorScheme.surfaceVariant,
+        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+    ) {
+        Box(
+            Modifier.background(
+                Brush.linearGradient(
+                    listOf(
+                        MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.65f),
+                        MaterialTheme.colorScheme.surface,
+                        MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.62f)
+                    )
+                )
+            )
+        ) {
+            Column(Modifier.padding(top = 16.dp, start = 16.dp, end = 16.dp)) {
+                Text("Solve Fast. Strike First.", style = MaterialTheme.typography.titleLarge)
+                Text(
+                    "Challenge opponents with your maths skills.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
+                Image(
+                    painter = painterResource(R.drawable.home_robot_duel),
+                    contentDescription = "Blue and red robots ready to battle",
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier.fillMaxWidth().aspectRatio(800f / 280f)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PlayerProgressSection(stats: ProfileStats?, onProfile: () -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(GameDimensions.itemSpacing)) {
+        SectionHeading("Player progress", actionLabel = "View profile", onAction = onProfile)
+        Card(
+            Modifier.fillMaxWidth(),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+        ) {
+            if (stats == null) {
+                Text(
+                    "Progress is available when the server is connected.",
+                    modifier = Modifier.padding(16.dp),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else {
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(
+                        Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        CompactStatisticChip("Rating", stats.rating.toString(), Modifier.widthIn(min = 100.dp), GamePrimary)
+                        CompactStatisticChip("Tier", stats.tier, Modifier.widthIn(min = 100.dp), GameSecondary)
+                        CompactStatisticChip("Win rate", "${(stats.winRate * 100).toInt()}%", Modifier.widthIn(min = 100.dp), GameSuccess)
+                    }
+                    stats.progression?.let { progression ->
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Text("Level ${progression.level}", style = MaterialTheme.typography.labelLarge, modifier = Modifier.weight(1f))
+                            Text(
+                                "${progression.xpIntoCurrentLevel} / ${progression.xpRequiredForNextLevel} XP",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        AnimatedXpBar(progression.fraction, Modifier.fillMaxWidth())
+                    }
+                }
+            }
         }
     }
 }
@@ -384,132 +692,94 @@ private fun BattleScreen(
 }
 
 @Composable
-private fun SearchScreen(displayName: String, profileStats: ProfileStats?, search: MatchSearchState, onCancel: () -> Unit) {
-    Surface(Modifier.fillMaxSize()) {
-        Column(Modifier.fillMaxSize().safeDrawingPadding().padding(24.dp), horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center) {
-            Text("Finding an opponent…", style = MaterialTheme.typography.headlineSmall)
-            Text(displayName, modifier = Modifier.padding(top = 12.dp))
-            profileStats?.let { Text("Rating: ${it.rating} • ${it.tier}") }
-            Text("Mode: ${search.difficulty.name.lowercase().replaceFirstChar { it.uppercase() }}")
-            if (search.error.isNotBlank()) Text(search.error, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(top = 12.dp))
-            OutlinedButton(onClick = onCancel, modifier = Modifier.padding(top = 24.dp)) { Text("Cancel Search") }
-        }
-    }
-}
-
-@Composable
 private fun LeaderboardScreen(state: LeaderboardState, onBack: () -> Unit) {
     BackHandler(onBack = onBack)
-    Surface(Modifier.fillMaxSize()) {
-        Column(Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(20.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+        Column(
+            Modifier.fillMaxSize().safeDrawingPadding().verticalScroll(rememberScrollState()).padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
             Text("Leaderboard", style = MaterialTheme.typography.headlineSmall)
+            Text("Top robot battlers", color = MaterialTheme.colorScheme.onSurfaceVariant)
             when {
-                state.loading -> Text("Loading…", Modifier.padding(top = 20.dp))
-                !state.connected -> Text(state.error.ifBlank { "Connect to the server" }, Modifier.padding(top = 20.dp))
-                state.error.isNotBlank() -> Text(state.error, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(top = 20.dp))
-                state.rows.isEmpty() -> Text("No ranked players yet", Modifier.padding(top = 20.dp))
+                state.loading -> GameLoadingState("Loading leaderboard", Modifier.padding(top = 8.dp))
+                !state.connected -> InlineMessage(
+                    friendlyOnlineMessage(state.error).ifBlank { "Connect to view the leaderboard." },
+                    isError = false
+                )
+                state.error.isNotBlank() -> InlineMessage(friendlyOnlineMessage(state.error))
+                state.rows.isEmpty() -> InlineMessage("No ranked players yet.", isError = false)
                 else -> {
-                    if (state.currentPosition > 0) Text("Your position: #${state.currentPosition}", Modifier.padding(top = 12.dp))
-                    state.rows.forEach { row -> Text("#${row.position}  ${row.displayName}  ${row.rating} (${row.tier})  W${row.wins} L${row.losses}", fontWeight = if (row.current) FontWeight.Bold else FontWeight.Normal, modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) }
+                    if (state.currentPosition > 0) {
+                        Text("Your position: #${state.currentPosition}", color = MaterialTheme.colorScheme.primary)
+                    }
+                    state.rows.forEach { row -> LeaderboardRowCard(row) }
                 }
             }
-            OutlinedButton(onClick = onBack, Modifier.padding(top = 24.dp)) { Text("Back") }
+            GameSecondaryButton("Back to Home", onBack, Modifier.fillMaxWidth().padding(top = 8.dp))
         }
     }
 }
 
 @Composable
-private fun ConnectionCheckPanel(
+private fun LeaderboardRowCard(row: LeaderboardRow) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        color = if (row.current) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+        border = if (row.current) androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.primary) else null
+    ) {
+        Row(Modifier.fillMaxWidth().padding(horizontal = 14.dp, vertical = 12.dp), verticalAlignment = Alignment.CenterVertically) {
+            Text("#${row.position}", style = MaterialTheme.typography.titleMedium, color = MaterialTheme.colorScheme.primary)
+            Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                Text(row.displayName, style = MaterialTheme.typography.titleSmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text("${row.tier} • W${row.wins} L${row.losses}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            Text(row.rating.toString(), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+private fun ConnectionSettingsPanel(
     serverUrl: String,
     status: BattleViewModel.ConnectionStatus,
     message: String,
     onServerUrl: (String) -> Unit,
     onConnect: () -> Unit,
-    onDisconnect: () -> Unit,
-    roomCodeInput: String,
-    room: RoomInfo?,
-    roomError: String,
-    onRoomCode: (String) -> Unit,
-    onCreateRoom: () -> Unit,
-    onJoinRoom: () -> Unit,
-    onLeaveRoom: () -> Unit,
-    onReady: () -> Unit,
-    difficulty: Difficulty,
-    onDifficulty: (Difficulty) -> Unit
+    onDisconnect: () -> Unit
 ) {
-    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 12.dp)) {
-        Text("Connection check", style = MaterialTheme.typography.titleMedium)
-        OutlinedTextField(
-            value = serverUrl,
-            onValueChange = onServerUrl,
-            singleLine = true,
-            label = { Text("Server URL") },
-            modifier = Modifier.fillMaxWidth().padding(top = 6.dp)
-        )
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 4.dp)) {
-            Button(onClick = onConnect, enabled = status != BattleViewModel.ConnectionStatus.CONNECTING) {
-                Text("Connect")
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = MaterialTheme.colorScheme.surface,
+        shape = MaterialTheme.shapes.medium,
+        border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
+    ) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Development connection", style = MaterialTheme.typography.titleMedium)
+            OutlinedTextField(
+                value = serverUrl,
+                onValueChange = onServerUrl,
+                singleLine = true,
+                label = { Text("Server URL") },
+                modifier = Modifier.fillMaxWidth()
+            )
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                GamePrimaryButton(
+                    "Connect",
+                    onConnect,
+                    Modifier.weight(1f),
+                    enabled = status != BattleViewModel.ConnectionStatus.CONNECTING
+                )
+                GameSecondaryButton("Disconnect", onDisconnect, Modifier.weight(1f))
             }
-            OutlinedButton(onClick = onDisconnect) { Text("Disconnect") }
-        }
-        if (status != BattleViewModel.ConnectionStatus.IDLE || message.isNotEmpty()) {
-            Text("${status.name.lowercase().replace('_', ' ')}: $message",
-                style = MaterialTheme.typography.bodySmall,
-                color = if (status == BattleViewModel.ConnectionStatus.ERROR)
-                    MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-                modifier = Modifier.padding(top = 4.dp))
-        }
-        if (status == BattleViewModel.ConnectionStatus.CONNECTED) {
-            if (room == null) {
-                Text("Private room difficulty", style = MaterialTheme.typography.labelLarge, modifier = Modifier.padding(top = 8.dp))
-                DifficultySelector(difficulty, onDifficulty)
-                Button(onClick = onCreateRoom, modifier = Modifier.padding(top = 8.dp)) {
-                    Text("Create Room")
-                }
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                    OutlinedTextField(
-                        value = roomCodeInput,
-                        onValueChange = onRoomCode,
-                        singleLine = true,
-                        label = { Text("Room code") },
-                        modifier = Modifier.weight(1f)
-                    )
-                    Button(onClick = onJoinRoom, modifier = Modifier.align(Alignment.CenterVertically)) {
-                        Text("Join Room")
-                    }
-                }
-            } else {
-                Text("Room: ${room.code}", style = MaterialTheme.typography.titleMedium,
-                    modifier = Modifier.padding(top = 8.dp))
-                Text("Role: ${room.role}")
-                Text("Players: ${room.playerCount}/2")
-                Text("Difficulty: ${room.difficulty.name.lowercase().replaceFirstChar { it.uppercase() }}")
-                if (room.ranked) Text("Ranked • Host ${room.hostRating} ${room.hostTier} • Guest ${room.guestRating ?: "—"} ${room.guestTier ?: ""}")
-                if (!room.ranked && room.role.equals("Host", true) && !room.matchActive) DifficultySelector(room.difficulty, onDifficulty)
-                Text("Host: ${room.hostName} • ${if (room.hostReady) "Ready" else "Not ready"}")
-                Text("Guest: ${room.guestName.ifBlank { "Waiting…" }} • ${if (room.guestReady) "Ready" else "Not ready"}")
-                Text(if (room.playerCount == 2) "Both players connected" else "Waiting for opponent…")
-                if (!room.matchActive && room.playerCount == 2) {
-                    val ownReady = if (room.role.equals("Host", true)) room.hostReady else room.guestReady
-                    Button(onClick = onReady) { Text(if (ownReady) "Cancel Ready" else "Ready") }
-                }
-                OutlinedButton(onClick = onLeaveRoom) { Text("Leave Room") }
-            }
-            if (roomError.isNotEmpty()) {
-                Text(roomError, color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall)
-            }
-        }
-    }
-}
-
-@Composable
-private fun DifficultySelector(selected: Difficulty, onSelected: (Difficulty) -> Unit) {
-    Row(horizontalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.padding(vertical = 4.dp)) {
-        Difficulty.entries.forEach { value ->
-            TextButton(onClick = { onSelected(value) }) {
-                Text(if (value == selected) "[${value.name.lowercase().replaceFirstChar { it.uppercase() }}]" else value.name.lowercase().replaceFirstChar { it.uppercase() })
+            if (status != BattleViewModel.ConnectionStatus.IDLE || message.isNotEmpty()) {
+                Text(
+                    "${status.name.lowercase().replace('_', ' ')}: $message",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (status == BattleViewModel.ConnectionStatus.ERROR) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
         }
     }
@@ -518,13 +788,30 @@ private fun DifficultySelector(selected: Difficulty, onSelected: (Difficulty) ->
 @Composable
 private fun FeedbackControls(settings: FeedbackSettings, onSound: (Boolean) -> Unit,
                              onVibration: (Boolean) -> Unit) {
-    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        TextButton(onClick = { onSound(!settings.sound) }) {
-            Text("Sound: ${if (settings.sound) "On" else "Off"}")
-        }
-        TextButton(onClick = { onVibration(!settings.vibration) }) {
-            Text("Vibration: ${if (settings.vibration) "On" else "Off"}")
-        }
+    Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        GameSecondaryButton(
+            label = "Sound ${if (settings.sound) "On" else "Off"}",
+            onClick = { onSound(!settings.sound) },
+            modifier = Modifier.fillMaxWidth()
+        )
+        GameSecondaryButton(
+            label = "Vibration ${if (settings.vibration) "On" else "Off"}",
+            onClick = { onVibration(!settings.vibration) },
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
+}
+
+private fun friendlyOnlineMessage(message: String): String {
+    val value = message.trim()
+    if (value.isBlank()) return ""
+    return when {
+        value.contains("too many", ignoreCase = true) -> "Too many attempts. Try again shortly."
+        value.contains("session", ignoreCase = true) && value.contains("expired", ignoreCase = true) -> "Session expired. Reconnect."
+        value.contains("http://", ignoreCase = true) || value.contains("https://", ignoreCase = true) ||
+            value.contains("socket", ignoreCase = true) || value.contains("exception", ignoreCase = true) ->
+            "Server temporarily unavailable."
+        else -> value
     }
 }
 
