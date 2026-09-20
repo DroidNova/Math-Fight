@@ -1,0 +1,19 @@
+services:
+  postgres:
+    image: postgres:16.6
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: mathfight
+      POSTGRES_USER: mathfight
+      POSTGRES_PASSWORD: mathfight
+    ports:
+      - "5433:5432"
+    volumes:
+      - mathfight-postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mathfight -d mathfight"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+volumes:
+  mathfight-postgres:
