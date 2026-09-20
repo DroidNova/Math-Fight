@@ -73,6 +73,7 @@ fun LibGdxBattleArena(
             session,
             ArenaSnapshot(
                 battleId = state.battleId,
+                questionId = state.questionId,
                 leftHp = state.playerHp,
                 rightHp = state.opponentHp,
                 settled = state.phase == BattlePhase.ANSWERING,

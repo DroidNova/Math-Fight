@@ -1,128 +1,54 @@
 package com.droidnova.mathfight.ui.battle.arena
 
-import com.badlogic.gdx.graphics.Color
-import com.badlogic.gdx.graphics.glutils.ShapeRenderer
+import com.badlogic.gdx.graphics.g2d.SpriteBatch
+import com.badlogic.gdx.graphics.g2d.TextureRegion
 import com.badlogic.gdx.math.MathUtils
 
-/** Small, bounded particle collection owned exclusively by the render thread. */
+/** Fixed storage: no particle/projectile allocation during playback. */
 internal class ArenaEffects {
-    private data class Particle(
-        var x: Float,
-        var y: Float,
-        val velocityX: Float,
-        val velocityY: Float,
-        val duration: Float,
-        var life: Float,
-        val size: Float,
-        val red: Float,
-        val green: Float,
-        val blue: Float
-    )
-
-    private data class Burst(var x: Float, var y: Float, var life: Float = 0f)
-
-    private val particles = ArrayList<Particle>(MAX_PARTICLES)
-    private val bursts = ArrayList<Burst>(MAX_BURSTS)
-
-    fun spawnImpact(x: Float, y: Float, color: Color) {
-        if (bursts.size == MAX_BURSTS) bursts.removeAt(0)
-        bursts.add(Burst(x, y))
-        repeat(16) { index ->
-            val angle = index * (MathUtils.PI2 / 16f) + MathUtils.random(-0.12f, 0.12f)
-            val speed = MathUtils.random(105f, 245f)
-            addParticle(
-                x = x,
-                y = y,
-                velocityX = MathUtils.cos(angle) * speed,
-                velocityY = MathUtils.sin(angle) * speed,
-                duration = MathUtils.random(0.18f, 0.34f),
-                size = MathUtils.random(3.5f, 8f),
-                color = if (index % 3 == 0) Color.WHITE else color
-            )
+    private class Particle {
+        var x = 0f; var y = 0f; var vx = 0f; var vy = 0f; var life = 0f
+    }
+    private val particles = Array(48) { Particle() }
+    private var cursor = 0
+    private val flashes = Array(4) { Particle() }
+    private var flashCursor = 0
+    fun burst(x: Float, y: Float) {
+        val flash = flashes[flashCursor]
+        flashCursor = (flashCursor + 1) % flashes.size
+        flash.x = x; flash.y = y; flash.life = 0.2f
+        repeat(12) { index ->
+            val p = particles[cursor]
+            cursor = (cursor + 1) % particles.size
+            val angle = index * MathUtils.PI2 / 12f
+            p.x = x; p.y = y; p.life = 0.32f
+            p.vx = MathUtils.cos(angle) * (100f + index * 9f)
+            p.vy = MathUtils.sin(angle) * (100f + index * 9f)
         }
     }
-
-    fun spawnLowHealthSpark(x: Float, y: Float, color: Color) {
-        addParticle(
-            x = x + MathUtils.random(-34f, 34f),
-            y = y + MathUtils.random(52f, 154f),
-            velocityX = MathUtils.random(-24f, 24f),
-            velocityY = MathUtils.random(32f, 76f),
-            duration = MathUtils.random(0.2f, 0.42f),
-            size = MathUtils.random(2f, 4.5f),
-            color = color
-        )
-    }
-
     fun update(delta: Float) {
-        for (index in particles.lastIndex downTo 0) {
-            val particle = particles[index]
-            particle.life += delta
-            if (particle.life >= particle.duration) {
-                particles.removeAt(index)
-            } else {
-                particle.x += particle.velocityX * delta
-                particle.y += particle.velocityY * delta
-            }
-        }
-        for (index in bursts.lastIndex downTo 0) {
-            val burst = bursts[index]
-            burst.life += delta
-            if (burst.life >= BURST_DURATION) bursts.removeAt(index)
+        for (f in flashes) f.life = (f.life - delta).coerceAtLeast(0f)
+        for (p in particles) if (p.life > 0f) {
+            p.life = (p.life - delta).coerceAtLeast(0f)
+            p.x += p.vx * delta; p.y += p.vy * delta
         }
     }
-
-    fun draw(shapes: ShapeRenderer) {
-        bursts.forEach { burst ->
-            val progress = burst.life / BURST_DURATION
-            val alpha = (1f - progress).coerceAtLeast(0f)
-            shapes.color.set(0.88f, 0.98f, 1f, alpha * 0.22f)
-            shapes.circle(burst.x, burst.y, 18f + progress * 58f, 24)
-            shapes.color.set(1f, 0.93f, 0.52f, alpha * 0.9f)
-            repeat(8) { ray ->
-                val angle = ray * MathUtils.PI2 / 8f
-                val inner = 22f + progress * 18f
-                val outer = 52f + progress * 72f
-                shapes.rectLine(
-                    burst.x + MathUtils.cos(angle) * inner,
-                    burst.y + MathUtils.sin(angle) * inner,
-                    burst.x + MathUtils.cos(angle) * outer,
-                    burst.y + MathUtils.sin(angle) * outer,
-                    3.5f * alpha.coerceAtLeast(0.2f)
-                )
-            }
+    fun draw(batch: SpriteBatch, region: TextureRegion?) {
+        if (region == null) return
+        for (p in particles) if (p.life > 0f) {
+            batch.setColor(1f, 0.9f, 0.45f, p.life / 0.32f)
+            batch.draw(region, p.x - 7f, p.y - 7f, 14f, 14f)
         }
-        particles.forEach { particle ->
-            val progress = particle.life / particle.duration
-            val alpha = (1f - progress).coerceAtLeast(0f)
-            shapes.color.set(particle.red, particle.green, particle.blue, alpha)
-            shapes.circle(particle.x, particle.y, particle.size * (1f - progress * 0.45f), 8)
+        for (f in flashes) if (f.life > 0f) {
+            val size = 50f + (1f - f.life / 0.2f) * 70f
+            batch.setColor(1f, 1f, 0.8f, f.life / 0.2f)
+            batch.draw(region, f.x - size / 2f, f.y - size / 2f, size, size)
         }
+        batch.setColor(1f, 1f, 1f, 1f)
     }
-
     fun clear() {
-        particles.clear()
-        bursts.clear()
-    }
-
-    private fun addParticle(
-        x: Float,
-        y: Float,
-        velocityX: Float,
-        velocityY: Float,
-        duration: Float,
-        size: Float,
-        color: Color
-    ) {
-        if (particles.size == MAX_PARTICLES) particles.removeAt(0)
-        particles.add(
-            Particle(x, y, velocityX, velocityY, duration, 0f, size, color.r, color.g, color.b)
-        )
-    }
-
-    companion object {
-        private const val MAX_PARTICLES = 72
-        private const val MAX_BURSTS = 4
-        private const val BURST_DURATION = 0.24f
+        for (p in particles) p.life = 0f
+        for (f in flashes) f.life = 0f
+        cursor = 0; flashCursor = 0
     }
 }

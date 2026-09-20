@@ -1,0 +1,390 @@
+combat.png
+size: 2048, 2048
+format: RGBA8888
+filter: Linear, Linear
+repeat: none
+blue/idle
+  rotate: false
+  xy: 2, 2
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 0
+blue/idle
+  rotate: false
+  xy: 258, 2
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 1
+blue/idle
+  rotate: false
+  xy: 514, 2
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 2
+blue/idle
+  rotate: false
+  xy: 770, 2
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 3
+blue/melee
+  rotate: false
+  xy: 1026, 2
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 0
+blue/melee
+  rotate: false
+  xy: 1282, 2
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 1
+blue/melee
+  rotate: false
+  xy: 1538, 2
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 2
+blue/melee
+  rotate: false
+  xy: 1794, 2
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 3
+blue/projectile
+  rotate: false
+  xy: 2, 258
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 0
+blue/projectile
+  rotate: false
+  xy: 258, 258
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 1
+blue/projectile
+  rotate: false
+  xy: 514, 258
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 2
+blue/projectile
+  rotate: false
+  xy: 770, 258
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 3
+blue/hit
+  rotate: false
+  xy: 1026, 258
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 0
+blue/hit
+  rotate: false
+  xy: 1282, 258
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 1
+blue/hit
+  rotate: false
+  xy: 1538, 258
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 2
+blue/hit
+  rotate: false
+  xy: 1794, 258
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 3
+blue/ko
+  rotate: false
+  xy: 2, 514
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 0
+blue/ko
+  rotate: false
+  xy: 258, 514
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 1
+blue/ko
+  rotate: false
+  xy: 514, 514
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 2
+blue/ko
+  rotate: false
+  xy: 770, 514
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 3
+blue/victory
+  rotate: false
+  xy: 1026, 514
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 0
+blue/victory
+  rotate: false
+  xy: 1282, 514
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 1
+blue/victory
+  rotate: false
+  xy: 1538, 514
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 2
+blue/victory
+  rotate: false
+  xy: 1794, 514
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 3
+red/idle
+  rotate: false
+  xy: 2, 770
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 0
+red/idle
+  rotate: false
+  xy: 258, 770
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 1
+red/idle
+  rotate: false
+  xy: 514, 770
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 2
+red/idle
+  rotate: false
+  xy: 770, 770
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 3
+red/melee
+  rotate: false
+  xy: 1026, 770
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 0
+red/melee
+  rotate: false
+  xy: 1282, 770
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 1
+red/melee
+  rotate: false
+  xy: 1538, 770
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 2
+red/melee
+  rotate: false
+  xy: 1794, 770
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 3
+red/projectile
+  rotate: false
+  xy: 2, 1026
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 0
+red/projectile
+  rotate: false
+  xy: 258, 1026
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 1
+red/projectile
+  rotate: false
+  xy: 514, 1026
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 2
+red/projectile
+  rotate: false
+  xy: 770, 1026
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 3
+red/hit
+  rotate: false
+  xy: 1026, 1026
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 0
+red/hit
+  rotate: false
+  xy: 1282, 1026
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 1
+red/hit
+  rotate: false
+  xy: 1538, 1026
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 2
+red/hit
+  rotate: false
+  xy: 1794, 1026
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 3
+red/ko
+  rotate: false
+  xy: 2, 1282
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 0
+red/ko
+  rotate: false
+  xy: 258, 1282
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 1
+red/ko
+  rotate: false
+  xy: 514, 1282
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 2
+red/ko
+  rotate: false
+  xy: 770, 1282
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 3
+red/victory
+  rotate: false
+  xy: 1026, 1282
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 0
+red/victory
+  rotate: false
+  xy: 1282, 1282
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 1
+red/victory
+  rotate: false
+  xy: 1538, 1282
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 2
+red/victory
+  rotate: false
+  xy: 1794, 1282
+  size: 252, 252
+  orig: 252, 252
+  offset: 0, 0
+  index: 3
+arena/background
+  rotate: false
+  xy: 2, 1538
+  size: 1000, 500
+  orig: 1000, 500
+  offset: 0, 0
+  index: -1
+arena/platform
+  rotate: false
+  xy: 1010, 1540
+  size: 1000, 120
+  orig: 1000, 120
+  offset: 0, 0
+  index: -1
+fx/shadow
+  rotate: false
+  xy: 1010, 1680
+  size: 128, 48
+  orig: 128, 48
+  offset: 0, 0
+  index: -1
+fx/glow
+  rotate: false
+  xy: 1150, 1680
+  size: 128, 128
+  orig: 128, 128
+  offset: 0, 0
+  index: -1
+fx/projectile
+  rotate: false
+  xy: 1290, 1680
+  size: 64, 64
+  orig: 64, 64
+  offset: 0, 0
+  index: -1
+fx/impact
+  rotate: false
+  xy: 1370, 1680
+  size: 64, 64
+  orig: 64, 64
+  offset: 0, 0
+  index: -1
+fx/paused
+  rotate: false
+  xy: 1450, 1680
+  size: 64, 64
+  orig: 64, 64
+  offset: 0, 0
+  index: -1

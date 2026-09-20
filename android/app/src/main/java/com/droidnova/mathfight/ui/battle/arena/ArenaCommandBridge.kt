@@ -32,6 +32,7 @@ data class ArenaSnapshot(
     val rightHp: Int,
     val settled: Boolean,
     val paused: Boolean,
+    val questionId: Long,
     val winner: ArenaSide?
 )
 
@@ -167,6 +168,7 @@ class ArenaCommandBridge {
 
     internal fun drain(session: Long): List<ArenaCommand> {
         if (disposed.get() || activeSession.get() != session) return emptyList()
+        if (pending.isEmpty()) return emptyList()
         val commands = ArrayList<ArenaCommand>()
         while (activeSession.get() == session) {
             val next = pending.poll() ?: break
