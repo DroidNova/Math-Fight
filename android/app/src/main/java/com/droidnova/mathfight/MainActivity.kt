@@ -130,13 +130,25 @@ class MainActivity : FragmentActivity(), AndroidFragmentApplication.Callbacks, A
             }
             MathFightTheme {
                 if (profile.loading || profile.loadFailed || profile.displayName.isBlank() || profile.showing) {
-                    ProfileScreen(profile, battleViewModel::setProfileName, battleViewModel::saveProfile,
-                        battleViewModel::editProfileName, battleViewModel::closeProfile, battleViewModel::loadProfile)
+                    ProfileScreen(
+                        state = profile,
+                        onName = battleViewModel::setProfileName,
+                        onSave = battleViewModel::saveProfile,
+                        onEditName = battleViewModel::editProfileName,
+                        onBack = battleViewModel::closeProfile,
+                        onRetry = battleViewModel::loadProfile,
+                        onRefresh = battleViewModel::openProfile,
+                        onFindMatch = {
+                            battleViewModel.closeProfile()
+                            battleViewModel.findMatch()
+                        }
+                    )
                 } else {
                 MathFightApp(
                     displayName = profile.displayName,
                     profileStats = profile.stats,
                     onProfile = battleViewModel::openProfile,
+                    onMatchHistory = battleViewModel::openMatchHistory,
                     leaderboard = leaderboard,
                     leaderboardOpen = leaderboardOpen,
                     onLeaderboard = battleViewModel::openLeaderboard,
@@ -155,7 +167,6 @@ class MainActivity : FragmentActivity(), AndroidFragmentApplication.Callbacks, A
                     onlinePaused = onlinePaused,
                     consumeVisualEvent = battleViewModel::consumeArenaVisualEvent,
                     settings = settings,
-                    debugConnection = (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0,
                     serverUrl = serverUrl,
                     connectionStatus = connectionStatus,
                     connectionMessage = connectionMessage,

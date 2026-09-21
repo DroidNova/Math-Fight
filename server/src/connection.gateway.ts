@@ -17,6 +17,8 @@ type Player = { id: string; tokenHash: string; profileId?: string; displayName?:
 type Room = { code: string; difficulty: Difficulty; ranked: boolean; host: Player; guest?: Player; hostReady: boolean; guestReady: boolean; match?: Match };
 type SearchEntry = { player: Player; searchId: string; difficulty: Difficulty; joinedAt: number };
 const MATCHMAKING_SEARCH_TTL_MS = 5 * 60_000;
+const COMBAT_ANIMATION_DURATION_MS = 860;
+const NEXT_QUESTION_DELAY_MS = 1_000;
 
 @WebSocketGateway({
   cors: { credentials: false, origin: (origin: string | undefined, callback: (error: Error | null, allowed?: boolean) => void) =>
@@ -574,8 +576,8 @@ export class ConnectionGateway implements OnGatewayConnection, OnGatewayDisconne
       const current = this.rooms.get(room.code);
       if (current !== room || current.match !== match || match.phase !== 'RESOLVING' || match.question.questionId !== questionId) return;
       if (ko) this.finishMatch(room, role);
-      else this.scheduleQuestion(room, 1_500, 'NEXT', 'match:question');
-    }, 500);
+      else this.scheduleQuestion(room, NEXT_QUESTION_DELAY_MS, 'NEXT', 'match:question');
+    }, COMBAT_ANIMATION_DURATION_MS);
     return accepted;
   }
   @SubscribeMessage('match:state')

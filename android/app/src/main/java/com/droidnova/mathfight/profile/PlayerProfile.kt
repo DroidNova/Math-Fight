@@ -2,6 +2,7 @@ package com.droidnova.mathfight.profile
 
 import android.content.Context
 import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.booleanPreferencesKey
 import androidx.datastore.preferences.core.stringPreferencesKey
 import androidx.datastore.preferences.preferencesDataStore
 import java.util.UUID
@@ -13,6 +14,12 @@ private val Context.profileDataStore by preferencesDataStore(name = "player_prof
 
 // Identity is deliberately absent from UI state and from generated toString output.
 class LocalProfile(val id: String, val displayName: String)
+
+data class AppPreferences(
+    val sound: Boolean = true,
+    val vibration: Boolean = true,
+    val serverUrl: String = ""
+)
 
 fun normalizedPlayerName(input: String): String? {
     val name = input.trim(' ').replace(Regex(" +"), " ")
@@ -29,6 +36,9 @@ class ProfileStore(context: Context) {
     private val nameKey = stringPreferencesKey("display_name")
     private val difficultyKey = stringPreferencesKey("difficulty")
     private val accountTokenKey = stringPreferencesKey("account_token")
+    private val soundKey = booleanPreferencesKey("sound_enabled")
+    private val vibrationKey = booleanPreferencesKey("vibration_enabled")
+    private val serverUrlKey = stringPreferencesKey("server_url")
 
     suspend fun load(): LocalProfile {
         val saved = store.edit { values ->
@@ -55,11 +65,34 @@ class ProfileStore(context: Context) {
         store.edit { it[difficultyKey] = difficulty.name }
     }
 
+    suspend fun loadPreferences(): AppPreferences = store.data.map { values ->
+        AppPreferences(
+            sound = values[soundKey] ?: true,
+            vibration = values[vibrationKey] ?: true,
+            serverUrl = values[serverUrlKey].orEmpty()
+        )
+    }.first()
+
+    suspend fun saveSound(enabled: Boolean) { store.edit { it[soundKey] = enabled } }
+    suspend fun saveVibration(enabled: Boolean) { store.edit { it[vibrationKey] = enabled } }
+    suspend fun saveServerUrl(value: String) { store.edit { it[serverUrlKey] = value } }
+
     suspend fun loadAccountToken(): String? = store.data.map { it[accountTokenKey] }.first()
     suspend fun saveAccountToken(token: String) { store.edit { it[accountTokenKey] = token } }
 }
 
-data class ProfileMatchStat(val localName: String, val result: String, val opponentName: String, val difficulty: String, val finishReason: String, val matchType: String = "UNRANKED", val ratingChange: Int? = null, val progression: XpResult? = null)
+data class ProfileMatchStat(
+    val matchId: String,
+    val localName: String,
+    val result: String,
+    val opponentName: String,
+    val difficulty: String,
+    val finishReason: String,
+    val matchType: String = "UNRANKED",
+    val ratingChange: Int? = null,
+    val progression: XpResult? = null,
+    val completedAt: String = ""
+)
 data class ProfileStats(val matchesPlayed: Int, val wins: Int, val losses: Int, val winRate: Double, val matches: List<ProfileMatchStat>, val rating: Int = 1000, val tier: String = "Silver", val leaderboardPosition: Int = 0, val progression: PlayerProgression? = null)
 
 data class ProfileUiState(
@@ -67,6 +100,7 @@ data class ProfileUiState(
     val loadFailed: Boolean = false,
     val displayName: String = "",
     val showing: Boolean = false,
+    val historyOnly: Boolean = false,
     val editing: Boolean = false,
     val nameInput: String = "",
     val saving: Boolean = false,

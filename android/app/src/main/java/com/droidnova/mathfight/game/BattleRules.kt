@@ -4,6 +4,9 @@ import kotlin.random.Random
 
 const val STARTING_HP = 100
 const val HIT_DAMAGE = 20
+const val COMBAT_ANIMATION_DURATION_MS = 860L
+const val NEXT_QUESTION_DELAY_MS = 1_000L
+private const val ATTACK_WINDUP_MS = 180L
 private const val BOT_MIN_DELAY_MS = 2_500L
 private const val BOT_MAX_DELAY_EXCLUSIVE_MS = 4_501L
 
@@ -61,7 +64,7 @@ fun generateQuestion(previous: Question? = null, difficulty: Difficulty = Diffic
     return if (fallback != previous) fallback else Question(1, Operation.ADD, 1)
 }
 
-enum class BattlePhase { HOME, ANSWERING, WINDUP, IMPACT, KO, RESULT }
+enum class BattlePhase { HOME, ANSWERING, WINDUP, IMPACT, TRANSITION, KO, RESULT }
 
 data class PhaseKey(val battleId: Long, val questionId: Long, val phase: BattlePhase)
 
@@ -152,24 +155,26 @@ fun advancePhase(
         BattlePhase.IMPACT -> when {
             state.opponentHp == 0 -> state.copy(phase = BattlePhase.KO, winner = Fighter.PLAYER)
             state.playerHp == 0 -> state.copy(phase = BattlePhase.KO, winner = Fighter.BOT)
-            else -> state.copy(
-                phase = BattlePhase.ANSWERING,
-                question = generateQuestion(state.question, difficulty, random),
-                questionId = state.questionId + 1,
-                input = "",
-                wrongAnswer = false,
-                attacker = null,
-                botRemainingMs = random.nextLong(BOT_MIN_DELAY_MS, BOT_MAX_DELAY_EXCLUSIVE_MS)
-            )
+            else -> state.copy(phase = BattlePhase.TRANSITION)
         }
+        BattlePhase.TRANSITION -> state.copy(
+            phase = BattlePhase.ANSWERING,
+            question = generateQuestion(state.question, difficulty, random),
+            questionId = state.questionId + 1,
+            input = "",
+            wrongAnswer = false,
+            attacker = null,
+            botRemainingMs = random.nextLong(BOT_MIN_DELAY_MS, BOT_MAX_DELAY_EXCLUSIVE_MS)
+        )
         BattlePhase.KO -> state.copy(phase = BattlePhase.RESULT)
         else -> state
     }
 }
 
 fun BattlePhase.durationMillis(): Long? = when (this) {
-    BattlePhase.WINDUP -> 180L
-    BattlePhase.IMPACT -> 320L
+    BattlePhase.WINDUP -> ATTACK_WINDUP_MS
+    BattlePhase.IMPACT -> COMBAT_ANIMATION_DURATION_MS - ATTACK_WINDUP_MS
+    BattlePhase.TRANSITION -> NEXT_QUESTION_DELAY_MS
     BattlePhase.KO -> 600L
     else -> null
 }

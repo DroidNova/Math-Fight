@@ -6,13 +6,17 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.LinearProgressIndicator
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.droidnova.mathfight.ui.theme.GameSecondary
+import com.droidnova.mathfight.ui.theme.GameSuccess
 
 @Composable
 fun XpResultPanel(result: XpResult, isResumed: Boolean, consumeAnimation: (String) -> Boolean) {
@@ -34,14 +38,29 @@ fun XpResultPanel(result: XpResult, isResumed: Boolean, consumeAnimation: (Strin
         }
     }
     Column(Modifier.fillMaxWidth().padding(top = 12.dp)) {
-        Text("+${result.xpAwarded} XP")
-        Text("Level ${result.newLevel} - ${result.newTotalXp} total XP")
+        Text(
+            "+${result.xpAwarded} XP",
+            color = GameSuccess,
+            fontWeight = FontWeight.Bold
+        )
+        Text(
+            "Level ${result.newLevel} - ${result.newTotalXp} total XP",
+            color = MaterialTheme.colorScheme.onSurface
+        )
         LinearProgressIndicator(progress = { progress.value }, modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp))
-        Text("${result.progression.xpIntoCurrentLevel} / ${result.progression.xpRequiredForNextLevel} XP")
-        Text("Level Up! Level ${result.newLevel}", modifier = Modifier.graphicsLayer {
-            alpha = levelUp.value
-            scaleX = 0.95f + 0.05f * levelUp.value
-            scaleY = scaleX
-        })
+        Text(
+            "${result.progression.xpIntoCurrentLevel} / ${result.progression.xpRequiredForNextLevel} XP",
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            "Level Up! Level ${result.newLevel}",
+            color = GameSecondary,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.graphicsLayer {
+                alpha = levelUp.value
+                scaleX = 0.95f + 0.05f * levelUp.value
+                scaleY = scaleX
+            }
+        )
     }
 }

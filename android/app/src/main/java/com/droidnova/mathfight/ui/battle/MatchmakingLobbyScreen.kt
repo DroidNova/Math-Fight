@@ -465,7 +465,7 @@ private fun LobbyScreen(
                 room.matchActive || bothReady -> "Starting…"
                 !hasOpponent -> "Waiting for opponent"
                 readyRequestPending -> "Starting…"
-                localReady -> "Ready ✓"
+                localReady -> "Ready"
                 else -> "Ready"
             }
             GamePrimaryButton(
@@ -619,6 +619,7 @@ private fun RoomCodeHeader(code: String, copied: Boolean, onCopy: () -> Unit, on
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.medium,
         color = MaterialTheme.colorScheme.surface.copy(alpha = 0.9f),
+        contentColor = MaterialTheme.colorScheme.onSurface,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.primary.copy(alpha = 0.48f))
     ) {
         Row(
@@ -775,6 +776,7 @@ private fun LobbyPlayerCard(
         modifier = modifier,
         shape = MaterialTheme.shapes.medium,
         color = MaterialTheme.colorScheme.surface.copy(alpha = 0.92f),
+        contentColor = MaterialTheme.colorScheme.onSurface,
         border = BorderStroke(if (ready) 2.dp else 1.dp, borderColor),
         shadowElevation = if (ready) 6.dp else 1.dp
     ) {
@@ -828,6 +830,7 @@ private fun LobbyConfiguration(room: RoomInfo, localIsHost: Boolean, onDifficult
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(14.dp),
         color = MaterialTheme.colorScheme.surface.copy(alpha = 0.88f),
+        contentColor = MaterialTheme.colorScheme.onSurface,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outline)
     ) {
         Column(Modifier.padding(horizontal = 11.dp, vertical = 8.dp), verticalArrangement = Arrangement.spacedBy(7.dp)) {
@@ -853,29 +856,35 @@ private fun LobbyConfiguration(room: RoomInfo, localIsHost: Boolean, onDifficult
 
 @Composable
 private fun ArenaLobbyBackdrop(content: @Composable () -> Unit) {
-    Box(
-        Modifier.fillMaxSize().background(
-            Brush.radialGradient(
-                colors = listOf(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.48f), MaterialTheme.colorScheme.background),
-                radius = 1_100f
-            )
-        )
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background,
+        contentColor = MaterialTheme.colorScheme.onBackground
     ) {
-        Canvas(Modifier.fillMaxSize()) {
-            val grid = GamePrimary.copy(alpha = 0.055f)
-            val step = 36.dp.toPx()
-            var x = 0f
-            while (x <= size.width) {
-                drawLine(grid, Offset(x, 0f), Offset(x, size.height), 1.dp.toPx())
-                x += step
+        Box(
+            Modifier.fillMaxSize().background(
+                Brush.radialGradient(
+                    colors = listOf(MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.48f), MaterialTheme.colorScheme.background),
+                    radius = 1_100f
+                )
+            )
+        ) {
+            Canvas(Modifier.fillMaxSize()) {
+                val grid = GamePrimary.copy(alpha = 0.055f)
+                val step = 36.dp.toPx()
+                var x = 0f
+                while (x <= size.width) {
+                    drawLine(grid, Offset(x, 0f), Offset(x, size.height), 1.dp.toPx())
+                    x += step
+                }
+                var y = 0f
+                while (y <= size.height) {
+                    drawLine(grid, Offset(0f, y), Offset(size.width, y), 1.dp.toPx())
+                    y += step
+                }
             }
-            var y = 0f
-            while (y <= size.height) {
-                drawLine(grid, Offset(0f, y), Offset(size.width, y), 1.dp.toPx())
-                y += step
-            }
+            content()
         }
-        content()
     }
 }
 

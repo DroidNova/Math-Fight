@@ -21,6 +21,7 @@ import kotlin.coroutines.resume
 import java.io.IOException
 import com.droidnova.mathfight.game.BattlePhase
 import com.droidnova.mathfight.game.BattleState
+import com.droidnova.mathfight.game.COMBAT_ANIMATION_DURATION_MS
 import com.droidnova.mathfight.game.Fighter
 import com.droidnova.mathfight.game.PhaseKey
 import com.droidnova.mathfight.game.Question
@@ -110,6 +111,7 @@ private data class ActiveQuestionWindow(
     val opensAt: Long,
     val closesAt: Long
 )
+private const val DEFAULT_SERVER_URL = "http://192.168.1.5:3000"
 private class ProfileSyncFailure(message: String) : Exception(message)
 private enum class RetryScope {
     CONNECTION, PROFILE, ACCOUNT_READ, ROOM_ENTRY, ROOM_CONTROL, MATCHMAKING, ANSWER, MATCH_STATE, TIME_SYNC
@@ -155,7 +157,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     private var consumedArenaKo: PhaseKey? = null
 
     enum class ConnectionStatus { IDLE, CONNECTING, CONNECTED, DISCONNECTED, ERROR }
-    private val mutableServerUrl = MutableStateFlow("http://192.168.1.5:3000")
+    private val mutableServerUrl = MutableStateFlow(DEFAULT_SERVER_URL)
     val serverUrl = mutableServerUrl.asStateFlow()
     private val mutableConnectionStatus = MutableStateFlow(ConnectionStatus.IDLE)
     val connectionStatus = mutableConnectionStatus.asStateFlow()
@@ -226,6 +228,9 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
             try {
                 val loaded = profileStore.load()
                 mutableDifficulty.value = profileStore.loadDifficulty()
+                val preferences = profileStore.loadPreferences()
+                mutableSettings.value = FeedbackSettings(preferences.sound, preferences.vibration)
+                mutableServerUrl.value = preferences.serverUrl.ifBlank { DEFAULT_SERVER_URL }
                 localProfile = loaded
                 mutableProfile.value = ProfileUiState(loading = false, displayName = loaded.displayName, nameInput = loaded.displayName)
             } catch (_: IOException) {
@@ -237,7 +242,15 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
 
     fun openProfile() {
         if (state.value.phase != BattlePhase.HOME || room.value?.matchActive == true || profile.value.loading) return
-        mutableProfile.value = profile.value.copy(showing = true, editing = false, nameInput = profile.value.displayName, error = "", statsLoading = true)
+        mutableProfile.value = profile.value.copy(showing = true, historyOnly = false, editing = false,
+            nameInput = profile.value.displayName, error = "", statsLoading = true)
+        fetchProfileStats()
+    }
+
+    fun openMatchHistory() {
+        if (state.value.phase != BattlePhase.HOME || room.value?.matchActive == true || profile.value.loading) return
+        mutableProfile.value = profile.value.copy(showing = true, historyOnly = true, editing = false,
+            nameInput = profile.value.displayName, error = "", statsLoading = true)
         fetchProfileStats()
     }
 
@@ -291,7 +304,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         if (profile.value.saving) return
         mutableProfile.value = if (profile.value.editing) {
             profile.value.copy(editing = false, nameInput = profile.value.displayName, error = "")
-        } else profile.value.copy(showing = false, error = "")
+        } else profile.value.copy(showing = false, historyOnly = false, error = "")
     }
 
     fun setProfileName(value: String) {
@@ -351,9 +364,9 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         val operation = sessionOperation
         profileStatsTimeout?.cancel()
         val current = socket
-        if (retryBlocked(RetryScope.ACCOUNT_READ) { mutableProfile.value = profile.value.copy(statsLoading = false, stats = null) }) return
+        if (retryBlocked(RetryScope.ACCOUNT_READ) { mutableProfile.value = profile.value.copy(statsLoading = false) }) return
         if (current?.connected() != true || !sessionReady) {
-            mutableProfile.value = profile.value.copy(statsLoading = false, stats = null)
+            mutableProfile.value = profile.value.copy(statsLoading = false)
             return
         }
         mutableProfile.value = profile.value.copy(statsLoading = true)
@@ -361,7 +374,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
             delay(5_000)
             if (request == profileStatsRequest) {
                 profileStatsRequest++
-                mutableProfile.value = profile.value.copy(statsLoading = false, stats = null)
+                mutableProfile.value = profile.value.copy(statsLoading = false)
             }
         }
         current.emit("profile:stats", JSONObject(), io.socket.client.Ack { args ->
@@ -371,14 +384,26 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                 val response = args.firstOrNull() as? JSONObject
                 if (response?.optBoolean("ok") != true) {
                     if (response != null) serverErrorMessage(response, "Statistics unavailable", RetryScope.ACCOUNT_READ)
-                    mutableProfile.value = profile.value.copy(statsLoading = false, stats = null)
+                    mutableProfile.value = profile.value.copy(statsLoading = false)
                     return@post
                 }
                 val recent = mutableListOf<com.droidnova.mathfight.profile.ProfileMatchStat>()
                 val rows = response.optJSONArray("matches")
                 for (index in 0 until (rows?.length() ?: 0)) {
                     val row = rows?.optJSONObject(index) ?: continue
-                    recent += com.droidnova.mathfight.profile.ProfileMatchStat(row.optString("localName", profile.value.displayName), row.optString("result"), row.optString("opponentName"), row.optString("difficulty"), row.optString("finishReason"), row.optString("matchType", "UNRANKED"), if (row.isNull("ratingChange")) null else row.optInt("ratingChange"), row.optJSONObject("progression")?.let { parseXpResult(row.optString("matchId"), it) })
+                    val matchId = row.optString("matchId")
+                    recent += com.droidnova.mathfight.profile.ProfileMatchStat(
+                        matchId = matchId,
+                        localName = row.optString("localName").ifBlank { profile.value.displayName },
+                        result = row.optString("result"),
+                        opponentName = row.optString("opponentName"),
+                        difficulty = row.optString("difficulty"),
+                        finishReason = row.optString("finishReason"),
+                        matchType = row.optString("matchType", "UNRANKED"),
+                        ratingChange = if (row.isNull("ratingChange")) null else row.optInt("ratingChange"),
+                        progression = row.optJSONObject("progression")?.let { parseXpResult(matchId, it) },
+                        completedAt = row.optString("completedAt")
+                    )
                 }
                 mutableProfile.value = profile.value.copy(statsLoading = false, stats = com.droidnova.mathfight.profile.ProfileStats(response.optInt("matchesPlayed"), response.optInt("wins"), response.optInt("losses"), response.optDouble("winRate"), recent, response.optInt("rating", 1000), response.optString("tier", "Silver"), response.optInt("leaderboardPosition"), parseProgression(response)))
             }
@@ -491,8 +516,14 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         }
     }
 
-    fun setSound(enabled: Boolean) { mutableSettings.value = settings.value.copy(sound = enabled) }
-    fun setVibration(enabled: Boolean) { mutableSettings.value = settings.value.copy(vibration = enabled) }
+    fun setSound(enabled: Boolean) {
+        mutableSettings.value = settings.value.copy(sound = enabled)
+        viewModelScope.launch { runCatching { profileStore.saveSound(enabled) } }
+    }
+    fun setVibration(enabled: Boolean) {
+        mutableSettings.value = settings.value.copy(vibration = enabled)
+        viewModelScope.launch { runCatching { profileStore.saveVibration(enabled) } }
+    }
 
     fun readyToggle() {
         if (retryBlocked(RetryScope.ROOM_CONTROL, ::setRoomError)) return
@@ -527,6 +558,7 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     fun setServerUrl(value: String) {
         if (value == mutableServerUrl.value) return
         mutableServerUrl.value = value
+        viewModelScope.launch { runCatching { profileStore.saveServerUrl(value) } }
         retryUntilElapsedMs.clear()
         endParticipation()
     }
@@ -1105,6 +1137,11 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
         scheduledOnlineQuestion = scheduled
         mutableOnlineAnswerLocked.value = true
         mutableOnlinePaused.value = reason == "RESUME"
+        mutableOnlineQuestionPrompt.value = when (reason) {
+            "FIRST" -> "Get ready\u2026"
+            "RESUME" -> "Resuming\u2026"
+            else -> "Next question\u2026"
+        }
         mutableState.value = onlineBattleState(question, info, hostHp, guestHp, BattlePhase.ANSWERING)
             .copy(question = null, input = "", wrongAnswer = false, attacker = null)
         refreshQuestionCountdown()
@@ -1301,11 +1338,13 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
             if (mutableOnlineMatch.value != info || onlinePaused.value || !sessionReady) return@launch
             mutableState.value = onlineBattleState(question, info, hostHp, guestHp, BattlePhase.IMPACT, attacker)
             mutableFeedback.tryEmit(CombatFeedback(mutableState.value.key, FeedbackKind.HIT))
-            delay(320)
+            delay(COMBAT_ANIMATION_DURATION_MS - 180L)
             if (mutableOnlineMatch.value != info || onlinePaused.value || !sessionReady) return@launch
             if (value.optBoolean("ko")) {
                 mutableState.value = onlineBattleState(question, info, hostHp, guestHp, BattlePhase.KO, attacker).copy(winner = attacker)
                 mutableFeedback.tryEmit(CombatFeedback(mutableState.value.key, FeedbackKind.KO))
+            } else {
+                mutableState.value = onlineBattleState(question, info, hostHp, guestHp, BattlePhase.TRANSITION, attacker)
             }
         }
     }
@@ -1394,7 +1433,13 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
                 mutableOnlineAnswerLocked.value = true
                 lastAttackQuestion = maxOf(lastAttackQuestion, questionId)
                 // Recovery updates HP silently; it never restarts an attack or its effects.
-                mutableState.value = onlineBattleState(question, updatedInfo, hostHp, guestHp, BattlePhase.ANSWERING)
+                mutableOnlineQuestionPrompt.value = if (hostHp == 0 || guestHp == 0) {
+                    "Finishing battle\u2026"
+                } else {
+                    "Next question\u2026"
+                }
+                mutableState.value = onlineBattleState(question, updatedInfo, hostHp, guestHp, BattlePhase.TRANSITION)
+                    .copy(question = null, input = "", wrongAnswer = false, attacker = null)
             }
             "PAUSED" -> {
                 clearScheduledQuestion()
@@ -1723,6 +1768,8 @@ class BattleViewModel(private val profileStore: ProfileStore) : ViewModel() {
     private fun scheduleReconnect(generation: Long) {
         if (!wantsConnection || !connectionForeground || generation != connectionGeneration) return
         if (reconnectAttempt >= 5) {
+            mutableConnectionStatus.value = ConnectionStatus.ERROR
+            mutableConnectionMessage.value = "Could not reconnect. Try again."
             if (onlineMatch.value != null && state.value.phase != BattlePhase.RESULT) {
                 mutableOnlineSubmissionStatus.value = "Connection lost. Retry connection or go Back."
             }
